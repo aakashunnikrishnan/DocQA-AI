@@ -1,6 +1,7 @@
 """
 Vector store implementation using FAISS for efficient similarity search.
 Supports multiple index types, serialization, and hybrid search capabilities.
+FIXED: Vector dimension mismatch issues with proper validation and handling.
 """
 
 import os
@@ -49,8 +50,8 @@ class FAISSVectorStore:
     """
 
     INDEX_TYPES = {
-        "FlatIP": lambda d: faiss.IndexFlatIP(d),  # Inner product (cosine)
-        "FlatL2": lambda d: faiss.IndexFlatL2(d),  # L2 distance
+        "FlatIP": lambda d: faiss.IndexFlatIP(d),
+        "FlatL2": lambda d: faiss.IndexFlatL2(d),
         "HNSW32": lambda d: faiss.IndexHNSWFlat(d, 32),
         "HNSW64": lambda d: faiss.IndexHNSWFlat(d, 64),
         "IVF": lambda d: faiss.IndexIVFFlat(faiss.IndexFlatIP(d), d, 100),
@@ -72,7 +73,7 @@ class FAISSVectorStore:
         Initialize FAISS vector store.
 
         Args:
-            dimension: Embedding dimension
+            dimension: Embedding dimension (MUST match your embedding model)
             index_type: Type of FAISS index to use
             metric: Similarity metric ('cosine' or 'l2')
             index_path: Path to load existing index
@@ -152,6 +153,28 @@ class FAISSVectorStore:
         faiss.normalize_L2(vectors)
         return vectors
 
+    def _validate_embedding_dimension(self, embedding: np.ndarray) -> bool:
+        """
+        Validate that embedding dimension matches expected dimension.
+
+        Args:
+            embedding: Embedding vector to validate
+
+        Returns:
+            True if valid, False otherwise
+
+        Raises:
+            ValueError: If dimension mismatch
+        """
+        actual_dim = embedding.shape[-1] if len(embedding.shape) > 0 else len(embedding)
+
+        if actual_dim != self.dimension:
+            raise ValueError(
+                f"Vector dimension mismatch: expected {self.dimension}, got {actual_dim}. "
+                f"Please ensure your embedding model dimension matches the vector store dimension."
+            )
+        return True
+
     def add_embeddings(
         self,
         embeddings: List[List[float]],
@@ -163,13 +186,16 @@ class FAISSVectorStore:
         Add embeddings to the vector store.
 
         Args:
-            embeddings: List of embedding vectors
+            embeddings: List of embedding vectors (must match dimension)
             texts: List of corresponding text chunks
             metadata: Optional metadata for each chunk
             chunk_ids: Optional IDs for each chunk
 
         Returns:
             List of indices where embeddings were added
+
+        Raises:
+            ValueError: If embedding dimensions don't match
         """
         if not embeddings:
             logger.warning("No embeddings to add")
@@ -177,6 +203,14 @@ class FAISSVectorStore:
 
         # Convert to numpy array
         vectors = np.array(embeddings).astype(np.float32)
+
+        # FIX: Validate dimensions before adding
+        if vectors.shape[1] != self.dimension:
+            raise ValueError(
+                f"Embedding dimension mismatch: vectors have shape {vectors.shape[1]}, "
+                f"but vector store expects {self.dimension}. "
+                f"Please use the same embedding model for both generation and storage."
+            )
 
         # Normalize if using cosine similarity
         if self.metric == "cosine":
@@ -186,10 +220,20 @@ class FAISSVectorStore:
         indices = []
         start_idx = len(self.texts)
 
-        for i in range(vectors.shape[0]):
-            # Add single vector (FAISS requires 2D array)
-            self.index.add(vectors[i:i+1])
-            indices.append(start_idx + i)
+        try:
+            # Add all vectors at once for efficiency
+            self.index.add(vectors)
+
+        except Exception as e:
+            # FIX: Better error message for dimension issues
+            if "dimension" in str(e).lower():
+                raise ValueError(
+                    f"FAISS dimension error: {str(e)}. "
+                    f"Expected dimension {self.dimension}, "
+                    f"but got vectors with shape {vectors.shape}. "
+                    f"Please check your embedding model configuration."
+                )
+            raise
 
         # Store text and metadata
         self.texts.extend(texts)
@@ -203,6 +247,9 @@ class FAISSVectorStore:
             self.chunk_ids.extend(chunk_ids)
         else:
             self.chunk_ids.extend([f"chunk_{start_idx + i}" for i in range(len(texts))])
+
+        # Return indices
+        indices = list(range(start_idx, len(self.texts)))
 
         logger.info(f"Added {len(embeddings)} embeddings. Total: {len(self.texts)}")
 
@@ -219,13 +266,16 @@ class FAISSVectorStore:
         Search for similar vectors.
 
         Args:
-            query_embedding: Query embedding vector
+            query_embedding: Query embedding vector (must match dimension)
             top_k: Number of results to return
             score_threshold: Minimum similarity score threshold
             filter_metadata: Filter results by metadata (exact match)
 
         Returns:
             List of SearchResult objects
+
+        Raises:
+            ValueError: If query embedding dimension doesn't match
         """
         if len(self.texts) == 0:
             logger.warning("Vector store is empty")
@@ -233,6 +283,14 @@ class FAISSVectorStore:
 
         # Prepare query vector
         query = np.array([query_embedding]).astype(np.float32)
+
+        # FIX: Validate query dimension
+        if query.shape[1] != self.dimension:
+            raise ValueError(
+                f"Query embedding dimension mismatch: got {query.shape[1]}, "
+                f"expected {self.dimension}. "
+                f"Please ensure you're using the same embedding model for queries."
+            )
 
         # Normalize if using cosine similarity
         if self.metric == "cosine":
@@ -250,7 +308,10 @@ class FAISSVectorStore:
             indices = indices[0]
 
         except Exception as e:
+            # FIX: Better error handling for search failures
             logger.error(f"FAISS search failed: {e}")
+            if "dimension" in str(e).lower():
+                raise ValueError(f"FAISS search dimension error: {str(e)}")
             return []
 
         # Build results
@@ -311,12 +372,23 @@ class FAISSVectorStore:
 
         Returns:
             List of result lists for each query
+
+        Raises:
+            ValueError: If any query embedding dimension doesn't match
         """
         if len(self.texts) == 0:
             return [[] for _ in query_embeddings]
 
         # Prepare query matrix
         queries = np.array(query_embeddings).astype(np.float32)
+
+        # FIX: Validate all query dimensions
+        if queries.shape[1] != self.dimension:
+            raise ValueError(
+                f"Query embedding dimension mismatch: got {queries.shape[1]}, "
+                f"expected {self.dimension}. "
+                f"Please ensure you're using the same embedding model for all queries."
+            )
 
         # Normalize if using cosine similarity
         if self.metric == "cosine":
@@ -329,7 +401,10 @@ class FAISSVectorStore:
         try:
             all_scores, all_indices = self.index.search(queries, actual_k)
         except Exception as e:
+            # FIX: Better error handling for batch search
             logger.error(f"Batch FAISS search failed: {e}")
+            if "dimension" in str(e).lower():
+                raise ValueError(f"FAISS batch search dimension error: {str(e)}")
             return [[] for _ in query_embeddings]
 
         # Build results
@@ -408,9 +483,21 @@ class FAISSVectorStore:
             embedding: New embedding vector
             text: New text
             metadata: New metadata
+
+        Raises:
+            ValueError: If embedding dimension doesn't match
         """
         if index < 0 or index >= len(self.texts):
             raise IndexError(f"Index {index} out of range")
+
+        # FIX: Validate dimension before updating
+        embedding_array = np.array(embedding).astype(np.float32)
+        if embedding_array.shape[0] != self.dimension:
+            raise ValueError(
+                f"Embedding dimension mismatch: got {embedding_array.shape[0]}, "
+                f"expected {self.dimension}. "
+                f"Please ensure you're using the correct embedding model."
+            )
 
         # Update stored data
         self.texts[index] = text
@@ -463,6 +550,10 @@ class FAISSVectorStore:
 
         Args:
             path: Directory path to load from
+
+        Raises:
+            FileNotFoundError: If path doesn't exist
+            ValueError: If loaded index dimension doesn't match
         """
         load_path = Path(path)
 
@@ -472,7 +563,16 @@ class FAISSVectorStore:
         # Load FAISS index
         index_path = load_path / "index.faiss"
         if index_path.exists():
-            self.index = faiss.read_index(str(index_path))
+            loaded_index = faiss.read_index(str(index_path))
+
+            # FIX: Validate loaded index dimension
+            if hasattr(loaded_index, 'd') and loaded_index.d != self.dimension:
+                raise ValueError(
+                    f"Loaded index dimension ({loaded_index.d}) does not match "
+                    f"expected dimension ({self.dimension}). "
+                    f"Please ensure you're loading a compatible index."
+                )
+            self.index = loaded_index
 
         # Load metadata
         data_path = load_path / "data.pkl"
@@ -482,6 +582,13 @@ class FAISSVectorStore:
                 self.texts = data.get('texts', [])
                 self.metadata = data.get('metadata', [])
                 self.chunk_ids = data.get('chunk_ids', [])
+
+        # FIX: Verify loaded data matches index
+        if len(self.texts) != self.index.ntotal:
+            logger.warning(
+                f"Data count ({len(self.texts)}) does not match index count ({self.index.ntotal}). "
+                f"This may indicate a corrupted load."
+            )
 
         logger.info(f"Loaded vector store from {path}: {len(self.texts)} items")
 
@@ -510,12 +617,23 @@ class FAISSVectorStore:
 
         Args:
             embeddings: Training embeddings
+
+        Raises:
+            ValueError: If embedding dimensions don't match
         """
         if not hasattr(self.index, 'train'):
             logger.info("Index doesn't require training")
             return
 
         vectors = np.array(embeddings).astype(np.float32)
+
+        # FIX: Validate dimensions before training
+        if vectors.shape[1] != self.dimension:
+            raise ValueError(
+                f"Training embedding dimension mismatch: got {vectors.shape[1]}, "
+                f"expected {self.dimension}. "
+                f"Please ensure you're using the correct embedding model."
+            )
 
         if self.metric == "cosine":
             vectors = self._normalize_vectors(vectors)
@@ -529,9 +647,19 @@ class FAISSVectorStore:
 
         Args:
             other: Another FAISSVectorStore instance
+
+        Raises:
+            ValueError: If dimensions don't match
         """
         if not other.texts:
             return
+
+        # FIX: Validate dimensions match before merging
+        if other.dimension != self.dimension:
+            raise ValueError(
+                f"Cannot merge vector stores: dimensions differ. "
+                f"Current: {self.dimension}, Other: {other.dimension}"
+            )
 
         # Merge data
         self.texts.extend(other.texts)
@@ -542,6 +670,10 @@ class FAISSVectorStore:
         # For now, we need to re-add all vectors
         logger.warning("Merging requires rebuilding index. Consider adding embeddings directly.")
 
+    def get_dimension(self) -> int:
+        """Get the dimension of the vector store."""
+        return self.dimension
+
     def get_stats(self) -> Dict[str, Any]:
         """Get statistics about the vector store."""
         return {
@@ -551,7 +683,9 @@ class FAISSVectorStore:
             "metric": self.metric,
             "index_size_bytes": self.index.ntotal * self.dimension * 4 if hasattr(self.index, 'ntotal') else 0,
             "average_text_length": np.mean([len(t) for t in self.texts]) if self.texts else 0,
-            "has_metadata": sum(1 for m in self.metadata if m) > 0
+            "has_metadata": sum(1 for m in self.metadata if m) > 0,
+            "index_ntotal": getattr(self.index, 'ntotal', 0),
+            "is_trained": getattr(self.index, 'is_trained', True)
         }
 
 
@@ -593,7 +727,7 @@ class FAISSHybridStore(FAISSVectorStore):
         chunk_ids: Optional[List[str]] = None
     ) -> List[int]:
         """Add embeddings and prepare for hybrid search."""
-        # Add to vector store
+        # Add to vector store (dimension validation happens in parent)
         indices = super().add_embeddings(embeddings, texts, metadata, chunk_ids)
 
         # Add to BM25 corpus
@@ -625,6 +759,14 @@ class FAISSHybridStore(FAISSVectorStore):
         Returns:
             List of SearchResult objects
         """
+        # FIX: Validate query embedding dimension
+        if len(query_embedding) != self.dimension:
+            raise ValueError(
+                f"Query embedding dimension mismatch: got {len(query_embedding)}, "
+                f"expected {self.dimension}. "
+                f"Please ensure you're using the same embedding model for queries."
+            )
+
         # Get vector search results (get more for reranking)
         vector_k = top_k * 3
         vector_results = self.search(query_embedding, vector_k, score_threshold=None)
@@ -640,10 +782,11 @@ class FAISSHybridStore(FAISSVectorStore):
 
             # Normalize BM25 scores to [0, 1]
             max_score = max(bm25_scores) if bm25_scores else 1
-            for i, score in enumerate(bm25_scores):
-                if i < len(self.texts):
-                    normalized_score = score / max_score if max_score > 0 else 0
-                    keyword_scores[i] = normalized_score
+            if max_score > 0:
+                for i, score in enumerate(bm25_scores):
+                    if i < len(self.texts):
+                        normalized_score = score / max_score
+                        keyword_scores[i] = normalized_score
 
         # Combine scores
         for result in vector_results:
@@ -672,6 +815,13 @@ class FAISSHybridStore(FAISSVectorStore):
         self._bm25 = None
         logger.info("Cleared hybrid vector store")
 
+    def get_stats(self) -> Dict[str, Any]:
+        """Get statistics including hybrid store info."""
+        stats = super().get_stats()
+        stats["hybrid_enabled"] = self._bm25 is not None
+        stats["bm25_corpus_size"] = len(self._bm25_corpus)
+        return stats
+
 
 # Convenience function
 def create_vector_store(
@@ -685,7 +835,7 @@ def create_vector_store(
     Create a FAISS vector store with specified configuration.
 
     Args:
-        dimension: Embedding dimension
+        dimension: Embedding dimension (MUST match your embedding model)
         index_type: Type of FAISS index
         metric: Similarity metric
         index_path: Path to load existing index
@@ -703,31 +853,57 @@ def create_vector_store(
     )
 
 
+def validate_embedding_dimension(embedding: List[float], expected_dimension: int) -> bool:
+    """
+    Helper function to validate embedding dimension.
+
+    Args:
+        embedding: Embedding vector
+        expected_dimension: Expected dimension
+
+    Returns:
+        True if valid
+
+    Raises:
+        ValueError: If dimension mismatch
+    """
+    actual_dim = len(embedding)
+    if actual_dim != expected_dimension:
+        raise ValueError(
+            f"Embedding dimension mismatch: got {actual_dim}, expected {expected_dimension}. "
+            f"Please check your embedding model configuration."
+        )
+    return True
+
+
 if __name__ == "__main__":
-    # Example usage
+    # Example usage with dimension validation
     logging.basicConfig(level=logging.INFO)
 
-    # Create vector store
-    store = create_vector_store(dimension=1536, index_type="HNSW64")
+    # Create vector store with specific dimension
+    dimension = 1536
+    store = create_vector_store(dimension=dimension, index_type="HNSW64")
 
-    # Generate dummy embeddings
-    dummy_embeddings = [np.random.randn(1536).tolist() for _ in range(10)]
+    # Generate dummy embeddings with correct dimension
+    dummy_embeddings = [np.random.randn(dimension).tolist() for _ in range(10)]
     dummy_texts = [f"This is document {i}" for i in range(10)]
 
-    # Add embeddings
-    store.add_embeddings(dummy_embeddings, dummy_texts)
+    try:
+        # Add embeddings (dimension validation happens automatically)
+        store.add_embeddings(dummy_embeddings, dummy_texts)
+        print(f"Added {store.get_size()} embeddings")
 
-    # Search
-    query = np.random.randn(1536).tolist()
-    results = store.search(query, top_k=3)
+        # Test search with correct dimension
+        query = np.random.randn(dimension).tolist()
+        results = store.search(query, top_k=3)
+        print(f"Search returned {len(results)} results")
 
-    print(f"Search results: {len(results)}")
-    for i, result in enumerate(results):
-        print(f"  {i+1}. Score: {result.score:.4f} - {result.text[:50]}")
+        # Test with wrong dimension (should raise error)
+        try:
+            wrong_query = np.random.randn(768).tolist()  # Wrong dimension
+            results = store.search(wrong_query, top_k=3)
+        except ValueError as e:
+            print(f"Expected error caught: {e}")
 
-    # Save
-    store.save("./test_vector_store")
-
-    # Load
-    new_store = create_vector_store(index_path="./test_vector_store")
-    print(f"Loaded store with {new_store.get_size()} vectors")
+    except ValueError as e:
+        print(f"Error: {e}")

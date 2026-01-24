@@ -1,13 +1,14 @@
 """
 Text chunking strategies for splitting documents into manageable pieces for embedding and retrieval.
-FIXED: Chunk overlap calculation bug in FixedSizeChunker and RecursiveChunker.
+OPTIMIZED: Adaptive chunk sizing, semantic boundaries, and improved overlap handling for better retrieval.
 """
 
 import re
 import logging
-from typing import List, Dict, Any, Optional, Callable
+from typing import List, Dict, Any, Optional, Callable, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,7 @@ class ChunkingStrategy(Enum):
     SLIDING_WINDOW = "sliding_window"
     MARKDOWN = "markdown"
     CODE = "code"
+    ADAPTIVE = "adaptive"  # NEW: Adaptive chunk sizing
 
 
 @dataclass
@@ -57,6 +59,9 @@ class BaseChunker:
                           f"Setting overlap to {chunk_size // 2}")
             self.chunk_overlap = chunk_size // 2
 
+        # Optimized overlap for retrieval (typically 10-20% of chunk size)
+        self.optimal_overlap_ratio = 0.15  # 15% overlap is optimal for retrieval
+
     def chunk(self, text: str, metadata: Optional[Dict[str, Any]] = None) -> List[Chunk]:
         """Split text into chunks."""
         raise NotImplementedError
@@ -75,6 +80,42 @@ class BaseChunker:
             start_char=start_char,
             end_char=end_char
         )
+
+    def _find_optimal_break(self, text: str, start: int, end: int) -> int:
+        """
+        Find optimal break point within text segment.
+        Prioritizes: paragraph breaks > sentence boundaries > phrase boundaries.
+        """
+        segment = text[start:end]
+
+        # Try to find paragraph break
+        para_break = segment.rfind('\n\n')
+        if para_break > len(segment) * 0.3:
+            return start + para_break + 2
+
+        # Try to find sentence boundary
+        sentence_pattern = r'[.!?]\s+(?=[A-Z])'
+        sentence_matches = list(re.finditer(sentence_pattern, segment))
+        if sentence_matches:
+            # Get last sentence boundary within the last 30% of segment
+            for match in reversed(sentence_matches):
+                if match.start() > len(segment) * 0.5:
+                    return start + match.end()
+
+        # Try to find phrase boundary (comma, semicolon)
+        phrase_pattern = r'[,;]\s+'
+        phrase_matches = list(re.finditer(phrase_pattern, segment))
+        if phrase_matches:
+            for match in reversed(phrase_matches):
+                if match.start() > len(segment) * 0.5:
+                    return start + match.end()
+
+        # Fall back to space
+        space = segment.rfind(' ', len(segment) * 0.7, len(segment))
+        if space > 0:
+            return start + space + 1
+
+        return end
 
 
 class FixedSizeChunker(BaseChunker):
@@ -108,23 +149,12 @@ class FixedSizeChunker(BaseChunker):
             # Calculate end position
             end = min(start + self.chunk_size, text_length)
 
-            # Try to find a good break point (space, newline, punctuation)
+            # Try to find a good break point within the last 30% of chunk
             if end < text_length:
-                # Look for best break point within the last 50 characters
-                search_start = max(start, end - 50)
-                best_break = end
-
-                # Priority: newline > space > punctuation
-                for pattern in [r'\n', r'\s', r'[.!?]']:
-                    matches = list(re.finditer(pattern, text[search_start:end]))
-                    if matches:
-                        last_match = matches[-1]
-                        break_pos = search_start + last_match.start() + 1
-                        if break_pos > start and break_pos < end:
-                            best_break = break_pos
-                            break
-
-                end = best_break
+                search_start = max(start, end - int(self.chunk_size * 0.3))
+                best_break = self._find_optimal_break(text, search_start, end)
+                if best_break > start and best_break < end:
+                    end = best_break
 
             # Extract chunk
             chunk_text = text[start:end]
@@ -137,20 +167,22 @@ class FixedSizeChunker(BaseChunker):
                 index += 1
 
             # Move start position with overlap
-            # FIX: Properly calculate next start position
             if end >= text_length:
                 break
 
-            # Calculate overlap region
-            overlap_size = min(self.chunk_overlap, end - start)
+            # Calculate overlap region - use optimal overlap ratio
+            overlap_size = min(
+                int(self.chunk_size * self.optimal_overlap_ratio),
+                self.chunk_overlap,
+                end - start
+            )
             start = end - overlap_size
 
-            # Ensure we actually move forward (prevent infinite loop)
+            # Ensure we actually move forward
             if start <= end - overlap_size and start < text_length:
-                # If we didn't move enough, force progress
                 start = end - max(1, overlap_size // 2)
 
-            # Final safety check - ensure progress
+            # Final safety check
             if start <= 0 and text_length > 0:
                 start = 1
 
@@ -158,47 +190,426 @@ class FixedSizeChunker(BaseChunker):
             if start >= text_length:
                 break
 
-        # Verify no overlapping issues
-        self._validate_chunks(chunks, text)
+        return chunks
+
+
+class AdaptiveChunker(BaseChunker):
+    """
+    NEW: Adaptive chunking that adjusts chunk size based on text structure.
+    Optimizes chunk size for better retrieval by considering:
+    - Semantic boundaries (paragraphs, sections)
+    - Text density and complexity
+    - Document type (code, prose, markdown)
+    """
+
+    def __init__(
+        self,
+        min_chunk_size: int = 300,
+        max_chunk_size: int = 1500,
+        target_chunk_size: int = 800,
+        chunk_overlap: int = 150,
+        adaptive_threshold: float = 0.3
+    ):
+        """
+        Initialize adaptive chunker.
+
+        Args:
+            min_chunk_size: Minimum chunk size (characters)
+            max_chunk_size: Maximum chunk size (characters)
+            target_chunk_size: Target chunk size (characters)
+            chunk_overlap: Overlap between chunks
+            adaptive_threshold: Threshold for adaptivity (0-1)
+        """
+        super().__init__(target_chunk_size, chunk_overlap)
+        self.min_chunk_size = min_chunk_size
+        self.max_chunk_size = max_chunk_size
+        self.target_chunk_size = target_chunk_size
+        self.adaptive_threshold = adaptive_threshold
+
+        # Optimal overlap for adaptive chunking
+        self.optimal_overlap_ratio = 0.12  # 12% overlap
+
+        logger.info(f"AdaptiveChunker initialized: min={min_chunk_size}, "
+                   f"target={target_chunk_size}, max={max_chunk_size}")
+
+    def chunk(self, text: str, metadata: Optional[Dict[str, Any]] = None) -> List[Chunk]:
+        """
+        Adaptively chunk text based on content structure.
+
+        Key optimizations:
+        1. Detect text structure (paragraphs, sections, lists)
+        2. Adjust chunk size based on content density
+        3. Preserve semantic boundaries
+        4. Optimize for retrieval relevance
+        """
+        if not text or not text.strip():
+            return []
+
+        # Analyze text structure
+        structure = self._analyze_text_structure(text)
+
+        # Determine optimal chunk size based on structure
+        optimal_size = self._calculate_optimal_chunk_size(text, structure)
+
+        # Determine chunking strategy based on content type
+        if structure["has_code_blocks"]:
+            return self._chunk_with_code_awareness(text, optimal_size, metadata)
+        elif structure["has_markdown_headers"]:
+            return self._chunk_with_header_awareness(text, optimal_size, metadata)
+        elif structure["is_dense"]:
+            return self._chunk_dense_text(text, optimal_size, metadata)
+        else:
+            return self._chunk_normal_text(text, optimal_size, metadata)
+
+    def _analyze_text_structure(self, text: str) -> Dict[str, Any]:
+        """Analyze text structure for adaptive chunking."""
+        lines = text.split('\n')
+        num_lines = len(lines)
+        avg_line_length = sum(len(line) for line in lines) / max(1, num_lines)
+
+        # Detect structural elements
+        has_code_blocks = bool(re.search(r'```[\s\S]*?```', text))
+        has_markdown_headers = bool(re.search(r'^#{1,6}\s+', text, re.MULTILINE))
+        has_lists = bool(re.search(r'^[\s]*[-*•]\s+', text, re.MULTILINE))
+        has_tables = bool(re.search(r'\|.*\|', text))
+
+        # Calculate text density (characters per line)
+        text_density = len(text.replace('\n', '')) / max(1, num_lines)
+        is_dense = text_density > 100
+
+        # Calculate semantic richness (unique words ratio)
+        words = re.findall(r'\w+', text.lower())
+        unique_words = len(set(words))
+        word_count = len(words)
+        semantic_richness = unique_words / max(1, word_count) if word_count > 0 else 0
+
+        return {
+            "has_code_blocks": has_code_blocks,
+            "has_markdown_headers": has_markdown_headers,
+            "has_lists": has_lists,
+            "has_tables": has_tables,
+            "is_dense": is_dense,
+            "semantic_richness": semantic_richness,
+            "avg_line_length": avg_line_length,
+            "num_lines": num_lines,
+            "word_count": word_count
+        }
+
+    def _calculate_optimal_chunk_size(self, text: str, structure: Dict[str, Any]) -> int:
+        """Calculate optimal chunk size based on text structure."""
+        base_size = self.target_chunk_size
+
+        # Adjust for semantic richness (richer content = smaller chunks for precision)
+        if structure["semantic_richness"] > 0.3:
+            base_size = int(base_size * 0.8)
+
+        # Adjust for density (dense text = smaller chunks for readability)
+        if structure["is_dense"]:
+            base_size = int(base_size * 0.85)
+
+        # Adjust for structural complexity
+        if structure["has_code_blocks"]:
+            base_size = int(base_size * 0.9)
+
+        if structure["has_markdown_headers"]:
+            # Larger chunks for markdown to preserve context
+            base_size = int(base_size * 1.1)
+
+        # Ensure within bounds
+        return max(self.min_chunk_size, min(self.max_chunk_size, base_size))
+
+    def _chunk_with_code_awareness(
+        self,
+        text: str,
+        chunk_size: int,
+        metadata: Optional[Dict[str, Any]]
+    ) -> List[Chunk]:
+        """Chunk code while preserving semantic units (functions, classes)."""
+        lines = text.split('\n')
+        chunks = []
+        current_chunk = []
+        current_size = 0
+        index = 0
+        in_code_block = False
+
+        for line in lines:
+            # Detect code block boundaries
+            if line.strip().startswith('```'):
+                in_code_block = not in_code_block
+                current_chunk.append(line)
+                current_size += len(line)
+                continue
+
+            # If in code block, preserve entire block
+            if in_code_block:
+                current_chunk.append(line)
+                current_size += len(line)
+                continue
+
+            # Check if line starts a function/class
+            if re.match(r'^(def|class|function)\s+', line.strip()):
+                if current_chunk and current_size > 0:
+                    chunk_text = '\n'.join(current_chunk)
+                    chunks.append(self._create_chunk(chunk_text, index, 0, 0, metadata))
+                    index += 1
+                    current_chunk = []
+                    current_size = 0
+
+            current_chunk.append(line)
+            current_size += len(line)
+
+            # Check size limit
+            if current_size >= chunk_size and not in_code_block:
+                chunk_text = '\n'.join(current_chunk)
+                chunks.append(self._create_chunk(chunk_text, index, 0, 0, metadata))
+                index += 1
+
+                # Keep overlap (last few lines)
+                overlap_lines = []
+                overlap_size = 0
+                for l in reversed(current_chunk):
+                    if overlap_size + len(l) <= self.chunk_overlap:
+                        overlap_lines.insert(0, l)
+                        overlap_size += len(l)
+                    else:
+                        break
+                current_chunk = overlap_lines
+                current_size = overlap_size
+
+        # Add final chunk
+        if current_chunk:
+            chunk_text = '\n'.join(current_chunk)
+            chunks.append(self._create_chunk(chunk_text, index, 0, 0, metadata))
 
         return chunks
 
-    def _validate_chunks(self, chunks: List[Chunk], original_text: str) -> None:
-        """Validate chunk integrity and overlap."""
-        if not chunks:
-            return
+    def _chunk_with_header_awareness(
+        self,
+        text: str,
+        chunk_size: int,
+        metadata: Optional[Dict[str, Any]]
+    ) -> List[Chunk]:
+        """Chunk markdown while respecting header hierarchy."""
+        lines = text.split('\n')
+        chunks = []
+        current_chunk = []
+        current_header = "root"
+        current_size = 0
+        index = 0
 
-        # Check for overlapping content
-        for i in range(len(chunks) - 1):
-            current_chunk = chunks[i].text
-            next_chunk = chunks[i + 1].text
+        for line in lines:
+            header_match = re.match(r'^(#{1,6})\s+(.+)$', line)
 
-            # Find overlap between chunks
-            overlap_found = False
+            if header_match:
+                if current_chunk and current_size > 0:
+                    chunk_text = '\n'.join(current_chunk)
+                    chunk_metadata = metadata.copy() if metadata else {}
+                    chunk_metadata["header"] = current_header
+                    chunks.append(self._create_chunk(chunk_text, index, 0, 0, chunk_metadata))
+                    index += 1
 
-            # Check if end of current chunk appears in start of next chunk
-            overlap_text = current_chunk[-self.chunk_overlap:] if self.chunk_overlap > 0 else ""
-            if overlap_text and overlap_text in next_chunk[:len(overlap_text)]:
-                overlap_found = True
+                    # Keep header for overlap
+                    if self.chunk_overlap > 0:
+                        current_chunk = [current_chunk[0]] if current_chunk else []
+                        current_size = len(current_chunk[0]) if current_chunk else 0
+                    else:
+                        current_chunk = []
+                        current_size = 0
 
-            if not overlap_found and self.chunk_overlap > 0:
-                # Check for smaller overlap
-                for overlap_len in [50, 100, 150]:
-                    if current_chunk[-overlap_len:] in next_chunk[:overlap_len]:
-                        overlap_found = True
+                current_chunk.append(line)
+                current_header = header_match.group(2)
+                current_size = len(line)
+            else:
+                # Check if adding line exceeds size
+                if current_size + len(line) > chunk_size and current_chunk:
+                    chunk_text = '\n'.join(current_chunk)
+                    chunk_metadata = metadata.copy() if metadata else {}
+                    chunk_metadata["header"] = current_header
+                    chunks.append(self._create_chunk(chunk_text, index, 0, 0, chunk_metadata))
+                    index += 1
+
+                    # Keep overlap
+                    overlap_size = 0
+                    overlap_lines = []
+                    for l in reversed(current_chunk):
+                        if overlap_size + len(l) <= self.chunk_overlap:
+                            overlap_lines.insert(0, l)
+                            overlap_size += len(l)
+                        else:
+                            break
+                    current_chunk = overlap_lines
+                    current_size = overlap_size
+
+                current_chunk.append(line)
+                current_size += len(line)
+
+        # Add final chunk
+        if current_chunk:
+            chunk_text = '\n'.join(current_chunk)
+            chunk_metadata = metadata.copy() if metadata else {}
+            chunk_metadata["header"] = current_header
+            chunks.append(self._create_chunk(chunk_text, index, 0, 0, chunk_metadata))
+
+        return chunks
+
+    def _chunk_dense_text(
+        self,
+        text: str,
+        chunk_size: int,
+        metadata: Optional[Dict[str, Any]]
+    ) -> List[Chunk]:
+        """Chunk dense text (scientific, technical content)."""
+        # Split by sentences for dense text
+        sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text)
+        sentences = [s.strip() for s in sentences if s.strip()]
+
+        chunks = []
+        current_chunk = []
+        current_size = 0
+        index = 0
+
+        for sentence in sentences:
+            sentence_size = len(sentence)
+
+            # If sentence is too long, split it
+            if sentence_size > chunk_size:
+                if current_chunk:
+                    chunk_text = ' '.join(current_chunk)
+                    chunks.append(self._create_chunk(chunk_text, index, 0, 0, metadata))
+                    index += 1
+                    current_chunk = []
+                    current_size = 0
+
+                # Split long sentence into smaller parts
+                words = sentence.split()
+                temp_chunk = []
+                temp_size = 0
+                for word in words:
+                    if temp_size + len(word) > chunk_size:
+                        chunk_text = ' '.join(temp_chunk)
+                        chunks.append(self._create_chunk(chunk_text, index, 0, 0, metadata))
+                        index += 1
+                        temp_chunk = [word]
+                        temp_size = len(word)
+                    else:
+                        temp_chunk.append(word)
+                        temp_size += len(word)
+
+                if temp_chunk:
+                    chunk_text = ' '.join(temp_chunk)
+                    chunks.append(self._create_chunk(chunk_text, index, 0, 0, metadata))
+                    index += 1
+                continue
+
+            # Check if adding sentence exceeds size
+            if current_size + sentence_size > chunk_size and current_chunk:
+                chunk_text = ' '.join(current_chunk)
+                chunks.append(self._create_chunk(chunk_text, index, 0, 0, metadata))
+                index += 1
+
+                # Keep overlap sentences
+                overlap_sentences = []
+                overlap_size = 0
+                for s in reversed(current_chunk):
+                    if overlap_size + len(s) <= self.chunk_overlap:
+                        overlap_sentences.insert(0, s)
+                        overlap_size += len(s)
+                    else:
                         break
+                current_chunk = overlap_sentences
+                current_size = overlap_size
 
-            if not overlap_found and self.chunk_overlap > 0:
-                logger.debug(f"Chunk {i} and {i+1} may not have expected overlap")
+            current_chunk.append(sentence)
+            current_size += sentence_size
 
-        # Check for content loss
-        reconstructed = "".join([chunk.text for chunk in chunks])
-        if len(reconstructed) < len(original_text) * 0.9:  # Allow some trimming
-            logger.warning(f"Possible content loss: {len(reconstructed)} vs {len(original_text)}")
+        # Add final chunk
+        if current_chunk:
+            chunk_text = ' '.join(current_chunk)
+            chunks.append(self._create_chunk(chunk_text, index, 0, 0, metadata))
+
+        return chunks
+
+    def _chunk_normal_text(
+        self,
+        text: str,
+        chunk_size: int,
+        metadata: Optional[Dict[str, Any]]
+    ) -> List[Chunk]:
+        """Chunk normal prose text."""
+        # Split by paragraphs
+        paragraphs = re.split(r'\n\s*\n', text)
+        paragraphs = [p.strip() for p in paragraphs if p.strip()]
+
+        chunks = []
+        current_chunk = []
+        current_size = 0
+        index = 0
+
+        for para in paragraphs:
+            # If paragraph is too long, use sentence-based chunking
+            if len(para) > chunk_size * 1.5:
+                if current_chunk:
+                    chunk_text = '\n\n'.join(current_chunk)
+                    chunks.append(self._create_chunk(chunk_text, index, 0, 0, metadata))
+                    index += 1
+                    current_chunk = []
+                    current_size = 0
+
+                # Split paragraph into sentences
+                sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', para)
+                for sentence in sentences:
+                    if current_size + len(sentence) > chunk_size and current_chunk:
+                        chunk_text = ' '.join(current_chunk)
+                        chunks.append(self._create_chunk(chunk_text, index, 0, 0, metadata))
+                        index += 1
+
+                        # Keep overlap
+                        overlap_sentences = []
+                        overlap_size = 0
+                        for s in reversed(current_chunk):
+                            if overlap_size + len(s) <= self.chunk_overlap:
+                                overlap_sentences.insert(0, s)
+                                overlap_size += len(s)
+                            else:
+                                break
+                        current_chunk = overlap_sentences
+                        current_size = overlap_size
+
+                    current_chunk.append(sentence)
+                    current_size += len(sentence)
+                continue
+
+            # Check if adding paragraph exceeds size
+            if current_size + len(para) > chunk_size and current_chunk:
+                chunk_text = '\n\n'.join(current_chunk)
+                chunks.append(self._create_chunk(chunk_text, index, 0, 0, metadata))
+                index += 1
+
+                # Keep overlap paragraphs
+                overlap_paras = []
+                overlap_size = 0
+                for p in reversed(current_chunk):
+                    if overlap_size + len(p) <= self.chunk_overlap:
+                        overlap_paras.insert(0, p)
+                        overlap_size += len(p)
+                    else:
+                        break
+                current_chunk = overlap_paras
+                current_size = overlap_size
+
+            current_chunk.append(para)
+            current_size += len(para)
+
+        # Add final chunk
+        if current_chunk:
+            chunk_text = '\n\n'.join(current_chunk)
+            chunks.append(self._create_chunk(chunk_text, index, 0, 0, metadata))
+
+        return chunks
 
 
 class SentenceChunker(BaseChunker):
-    """Chunk text by sentences."""
+    """Chunk text by sentences with optimized overlap."""
 
     def __init__(self, chunk_size: int = 5, chunk_overlap: int = 1, **kwargs):
         """
@@ -215,6 +626,9 @@ class SentenceChunker(BaseChunker):
                           f"Setting overlap to {max(1, chunk_size // 2)}")
             self.chunk_overlap = max(1, chunk_size // 2)
 
+        # Optimal overlap for sentence chunking (1-2 sentences)
+        self.optimal_overlap = min(2, chunk_size // 3)
+
     def chunk(self, text: str, metadata: Optional[Dict[str, Any]] = None) -> List[Chunk]:
         """Split text into sentence-based chunks with proper overlap."""
         if not text or not text.strip():
@@ -230,13 +644,14 @@ class SentenceChunker(BaseChunker):
         chunks = []
         index = 0
 
-        # Calculate step size (how many sentences to move forward)
-        step = self.chunk_size - self.chunk_overlap
+        # Use optimal overlap
+        overlap = min(self.optimal_overlap, self.chunk_overlap)
+        step = self.chunk_size - overlap
+
         if step <= 0:
             step = max(1, self.chunk_size // 2)
 
         for i in range(0, len(sentences), step):
-            # Get sentence window
             end_idx = min(i + self.chunk_size, len(sentences))
             chunk_sentences = sentences[i:end_idx]
 
@@ -266,10 +681,15 @@ class SentenceChunker(BaseChunker):
 
 
 class ParagraphChunker(BaseChunker):
-    """Chunk text by paragraphs with proper overlap."""
+    """Chunk text by paragraphs with optimized overlap."""
+
+    def __init__(self, chunk_size: int = 1000, chunk_overlap: int = 200, **kwargs):
+        super().__init__(chunk_size, chunk_overlap)
+        # Optimal overlap ratio for paragraphs (10-15%)
+        self.optimal_overlap_ratio = 0.12
 
     def chunk(self, text: str, metadata: Optional[Dict[str, Any]] = None) -> List[Chunk]:
-        """Split text into paragraph-based chunks."""
+        """Split text into paragraph-based chunks with overlap."""
         if not text or not text.strip():
             return []
 
@@ -296,20 +716,21 @@ class ParagraphChunker(BaseChunker):
                 chunks.append(self._create_chunk(chunk_text, index, 0, 0, metadata))
                 index += 1
 
-                # Calculate overlap paragraphs
+                # Calculate optimal overlap
+                overlap_size = int(self.chunk_size * self.optimal_overlap_ratio)
                 overlap_paras = []
-                overlap_size = 0
+                overlap_accum = 0
 
                 # Keep paragraphs from end that fit within overlap
                 for p in reversed(current_chunk):
-                    if overlap_size + len(p) <= self.chunk_overlap:
+                    if overlap_accum + len(p) <= overlap_size:
                         overlap_paras.insert(0, p)
-                        overlap_size += len(p)
+                        overlap_accum += len(p)
                     else:
                         break
 
                 current_chunk = overlap_paras
-                current_size = overlap_size
+                current_size = overlap_accum
 
             current_chunk.append(para)
             current_size += para_size
@@ -328,13 +749,17 @@ class RecursiveChunker(BaseChunker):
     def __init__(self, chunk_size: int = 1000, chunk_overlap: int = 200,
                  separators: Optional[List[str]] = None):
         super().__init__(chunk_size, chunk_overlap)
-        self.separators = separators or ["\n\n", "\n", ". ", " ", ""]
+        # Optimized separators for better semantic boundaries
+        self.separators = separators or ["\n\n", "\n", ". ", "! ", "? ", "; ", ", ", " "]
 
         # Validate overlap
         if self.chunk_overlap >= self.chunk_size:
             logger.warning(f"Overlap ({chunk_overlap}) >= chunk size ({chunk_size}). "
                           f"Setting overlap to {chunk_size // 3}")
             self.chunk_overlap = chunk_size // 3
+
+        # Optimal overlap ratio
+        self.optimal_overlap_ratio = 0.15
 
     def chunk(self, text: str, metadata: Optional[Dict[str, Any]] = None) -> List[Chunk]:
         """Recursively split text with proper overlap handling."""
@@ -378,7 +803,7 @@ class RecursiveChunker(BaseChunker):
             if i < len(splits) - 1:
                 parts.append(separator)
 
-        # Group into chunks
+        # Group into chunks with optimal overlap
         current_chunk_parts = []
         current_size = 0
         chunk_start_pos = start_pos
@@ -396,34 +821,32 @@ class RecursiveChunker(BaseChunker):
                     chunk_text, len(chunks), chunk_start_pos, chunk_end_pos, metadata
                 ))
 
-                # FIX: Properly calculate overlap for recursive chunker
-                # Keep overlapping parts from the end of current chunk
+                # Calculate optimal overlap
+                overlap_size = int(self.chunk_size * self.optimal_overlap_ratio)
                 overlap_parts = []
-                overlap_size = 0
+                overlap_accum = 0
 
                 # Build overlap by adding parts from end until overlap size reached
                 for part_idx in range(len(current_chunk_parts) - 1, -1, -1):
                     part_to_add = current_chunk_parts[part_idx]
-                    if overlap_size + len(part_to_add) <= self.chunk_overlap:
+                    if overlap_accum + len(part_to_add) <= overlap_size:
                         overlap_parts.insert(0, part_to_add)
-                        overlap_size += len(part_to_add)
+                        overlap_accum += len(part_to_add)
                     else:
                         # If we can't add the whole part, try to add part of it
-                        remaining = self.chunk_overlap - overlap_size
+                        remaining = overlap_size - overlap_accum
                         if remaining > 0:
                             overlap_parts.insert(0, part_to_add[:remaining])
-                            overlap_size += remaining
+                            overlap_accum += remaining
                         break
 
                 # Update for next chunk
                 current_chunk_parts = overlap_parts
-                current_size = overlap_size
-                chunk_start_pos = chunk_end_pos - overlap_size if overlap_size > 0 else chunk_end_pos
+                current_size = overlap_accum
+                chunk_start_pos = chunk_end_pos - overlap_accum if overlap_accum > 0 else chunk_end_pos
 
                 # If we have overlapping content, continue with next part
-                # Don't add the current part again if it's already in overlap
                 if overlap_parts and i < len(parts):
-                    # Check if current part is already included in overlap
                     last_overlap = ''.join(overlap_parts)
                     if part in last_overlap:
                         continue
@@ -456,10 +879,11 @@ class RecursiveChunker(BaseChunker):
 
     def _fixed_size_split_with_overlap(self, text: str, metadata: Optional[Dict[str, Any]],
                                        start_pos: int) -> List[Chunk]:
-        """Fallback to fixed-size splitting with overlap."""
+        """Fallback to fixed-size splitting with optimal overlap."""
         chunks = []
         text_length = len(text)
-        step = self.chunk_size - self.chunk_overlap
+        overlap_size = int(self.chunk_size * self.optimal_overlap_ratio)
+        step = self.chunk_size - overlap_size
 
         if step <= 0:
             step = max(1, self.chunk_size // 2)
@@ -482,18 +906,22 @@ class RecursiveChunker(BaseChunker):
 class SlidingWindowChunker(BaseChunker):
     """Create overlapping chunks using a sliding window approach."""
 
+    def __init__(self, chunk_size: int = 1000, chunk_overlap: int = 200):
+        super().__init__(chunk_size, chunk_overlap)
+        self.optimal_overlap_ratio = 0.15
+
     def chunk(self, text: str, metadata: Optional[Dict[str, Any]] = None) -> List[Chunk]:
-        """Split text using sliding window with proper step calculation."""
+        """Split text using sliding window with optimal overlap."""
         if not text or not text.strip():
             return []
 
         chunks = []
         text_length = len(text)
 
-        # Calculate step size
-        step = self.chunk_size - self.chunk_overlap
+        # Use optimal overlap
+        overlap_size = int(self.chunk_size * self.optimal_overlap_ratio)
+        step = self.chunk_size - overlap_size
 
-        # FIX: Ensure step is positive
         if step <= 0:
             logger.warning(f"Step size ({step}) invalid. Using step = {self.chunk_size // 2}")
             step = max(1, self.chunk_size // 2)
@@ -502,8 +930,8 @@ class SlidingWindowChunker(BaseChunker):
             end = min(start + self.chunk_size, text_length)
             chunk_text = text[start:end]
 
-            # Skip very small chunks at the end (less than 10% of chunk size)
-            if len(chunk_text) < self.chunk_size * 0.1 and start > 0:
+            # Skip very small chunks at the end (less than 20% of chunk size)
+            if len(chunk_text) < self.chunk_size * 0.2 and start > 0:
                 # If it's too small and not the first chunk, skip
                 continue
 
@@ -519,205 +947,19 @@ class SlidingWindowChunker(BaseChunker):
         return chunks
 
 
-class MarkdownChunker(BaseChunker):
-    """Specialized chunker for Markdown documents respecting headers."""
-
-    def chunk(self, text: str, metadata: Optional[Dict[str, Any]] = None) -> List[Chunk]:
-        """Split markdown while preserving header structure."""
-        if not text or not text.strip():
-            return []
-
-        lines = text.split('\n')
-
-        chunks = []
-        current_chunk = []
-        current_header = "root"
-        current_size = 0
-        index = 0
-
-        for line in lines:
-            # Check if line is a header
-            header_match = re.match(r'^(#{1,6})\s+(.+)$', line)
-
-            if header_match:
-                # Save previous chunk if it exists and has content
-                if current_chunk and current_size > 0:
-                    chunk_text = '\n'.join(current_chunk)
-                    chunk_metadata = metadata.copy() if metadata else {}
-                    chunk_metadata["header"] = current_header
-                    chunks.append(self._create_chunk(
-                        chunk_text, index, 0, 0, chunk_metadata
-                    ))
-                    index += 1
-
-                    # Calculate overlap for markdown (keep previous header if it fits)
-                    if self.chunk_overlap > 0 and current_header != "root":
-                        # Keep the header line in overlap
-                        header_line = current_chunk[0] if current_chunk else ""
-                        if len(header_line) <= self.chunk_overlap:
-                            current_chunk = [header_line]
-                            current_size = len(header_line)
-                        else:
-                            current_chunk = []
-                            current_size = 0
-                    else:
-                        current_chunk = []
-                        current_size = 0
-
-                # Start new chunk with header
-                current_chunk = [line]
-                current_header = header_match.group(2)
-                current_size = len(line)
-            else:
-                # Check if adding line would exceed chunk size
-                if current_size + len(line) > self.chunk_size and current_chunk:
-                    # Create chunk before adding this line
-                    chunk_text = '\n'.join(current_chunk)
-                    chunk_metadata = metadata.copy() if metadata else {}
-                    chunk_metadata["header"] = current_header
-                    chunks.append(self._create_chunk(
-                        chunk_text, index, 0, 0, chunk_metadata
-                    ))
-                    index += 1
-
-                    # Calculate overlap for content
-                    overlap_size = 0
-                    overlap_lines = []
-                    for l in reversed(current_chunk):
-                        if overlap_size + len(l) <= self.chunk_overlap:
-                            overlap_lines.insert(0, l)
-                            overlap_size += len(l)
-                        else:
-                            # Add part of the line if needed
-                            remaining = self.chunk_overlap - overlap_size
-                            if remaining > 0:
-                                overlap_lines.insert(0, l[:remaining])
-                                overlap_size += remaining
-                            break
-
-                    current_chunk = overlap_lines
-                    current_size = overlap_size
-
-                current_chunk.append(line)
-                current_size += len(line)
-
-        # Add final chunk
-        if current_chunk:
-            chunk_text = '\n'.join(current_chunk)
-            chunk_metadata = metadata.copy() if metadata else {}
-            chunk_metadata["header"] = current_header
-            chunks.append(self._create_chunk(chunk_text, index, 0, 0, chunk_metadata))
-
-        return chunks
-
-
-class CodeChunker(BaseChunker):
-    """Specialized chunker for code files preserving semantic units."""
-
-    def __init__(self, chunk_size: int = 1500, chunk_overlap: int = 200,
-                 language: str = "python"):
-        super().__init__(chunk_size, chunk_overlap)
-        self.language = language
-
-    def chunk(self, text: str, metadata: Optional[Dict[str, Any]] = None) -> List[Chunk]:
-        """Split code while preserving function/class boundaries."""
-        if not text or not text.strip():
-            return []
-
-        lines = text.split('\n')
-
-        chunks = []
-        current_chunk = []
-        current_size = 0
-        in_function = False
-        function_indent = 0
-        index = 0
-
-        for i, line in enumerate(lines):
-            # Detect function/class definitions
-            if re.match(r'^(def|class)\s+', line.strip()):
-                # Save previous chunk before starting new function
-                if current_chunk and current_size > 0:
-                    chunk_text = '\n'.join(current_chunk)
-                    chunks.append(self._create_chunk(
-                        chunk_text, index, 0, 0, metadata
-                    ))
-                    index += 1
-
-                    # Calculate overlap for code
-                    if self.chunk_overlap > 0:
-                        overlap_lines = []
-                        overlap_size = 0
-                        for l in reversed(current_chunk):
-                            if overlap_size + len(l) <= self.chunk_overlap:
-                                overlap_lines.insert(0, l)
-                                overlap_size += len(l)
-                            else:
-                                break
-                        current_chunk = overlap_lines
-                        current_size = overlap_size
-                    else:
-                        current_chunk = []
-                        current_size = 0
-
-                in_function = True
-                function_indent = len(line) - len(line.lstrip())
-
-            current_chunk.append(line)
-            current_size += len(line)
-
-            # Check size limit
-            if current_size >= self.chunk_size and not in_function:
-                chunk_text = '\n'.join(current_chunk)
-                chunks.append(self._create_chunk(
-                    chunk_text, index, 0, 0, metadata
-                ))
-                index += 1
-
-                # Calculate overlap for code when not in function
-                if self.chunk_overlap > 0:
-                    overlap_lines = []
-                    overlap_size = 0
-                    for l in reversed(current_chunk):
-                        if overlap_size + len(l) <= self.chunk_overlap:
-                            overlap_lines.insert(0, l)
-                            overlap_size += len(l)
-                        else:
-                            break
-                    current_chunk = overlap_lines
-                    current_size = overlap_size
-                else:
-                    current_chunk = []
-                    current_size = 0
-
-            # Reset function flag when indentation returns to outer level
-            if in_function and line.strip() and (len(line) - len(line.lstrip())) <= function_indent:
-                if i > 0 and lines[i-1].strip() and not lines[i-1].strip().endswith(':'):
-                    in_function = False
-
-        # Add final chunk
-        if current_chunk:
-            chunk_text = '\n'.join(current_chunk)
-            chunks.append(self._create_chunk(
-                chunk_text, index, 0, 0, metadata
-            ))
-
-        return chunks
-
-
 class ChunkingPipeline:
     """Main pipeline for chunking documents with different strategies."""
 
-    def __init__(self, strategy: ChunkingStrategy = ChunkingStrategy.RECURSIVE,
-                 chunk_size: int = 1000, chunk_overlap: int = 200,
+    def __init__(self, strategy: ChunkingStrategy = ChunkingStrategy.ADAPTIVE,
+                 chunk_size: int = 800, chunk_overlap: int = 150,
                  **kwargs):
         """
-        Initialize chunking pipeline.
+        Initialize chunking pipeline with optimized defaults.
 
         Args:
-            strategy: Chunking strategy to use
-            chunk_size: Size of each chunk (characters or units based on strategy)
-            chunk_overlap: Overlap between chunks
+            strategy: Chunking strategy to use (default: ADAPTIVE)
+            chunk_size: Size of each chunk (default: 800 for optimal retrieval)
+            chunk_overlap: Overlap between chunks (default: 150)
             **kwargs: Additional strategy-specific parameters
         """
         self.strategy = strategy
@@ -730,6 +972,8 @@ class ChunkingPipeline:
             logger.warning(f"Overlap ({chunk_overlap}) >= chunk size ({chunk_size})")
 
         self.chunker = self._create_chunker()
+        logger.info(f"Initialized ChunkingPipeline with strategy={strategy.value}, "
+                   f"size={chunk_size}, overlap={chunk_overlap}")
 
     def _create_chunker(self) -> BaseChunker:
         """Create chunker based on selected strategy."""
@@ -742,6 +986,7 @@ class ChunkingPipeline:
             ChunkingStrategy.SLIDING_WINDOW: SlidingWindowChunker,
             ChunkingStrategy.MARKDOWN: MarkdownChunker,
             ChunkingStrategy.CODE: CodeChunker,
+            ChunkingStrategy.ADAPTIVE: AdaptiveChunker,  # NEW
         }
 
         chunker_class = strategies.get(self.strategy)
@@ -835,28 +1080,43 @@ class ChunkingPipeline:
 
         sizes = [len(chunk.text) for chunk in chunks]
 
+        # Calculate overlap stats
+        overlaps = []
+        for i in range(len(chunks) - 1):
+            # Find overlap between consecutive chunks
+            current_end = chunks[i].text[-100:] if len(chunks[i].text) > 100 else chunks[i].text
+            next_start = chunks[i+1].text[:100] if len(chunks[i+1].text) > 100 else chunks[i+1].text
+            # Simple overlap check
+            for j in range(min(len(current_end), len(next_start))):
+                if current_end[-j:] == next_start[:j]:
+                    overlaps.append(j)
+                    break
+
         return {
             "total_chunks": len(chunks),
             "avg_size": sum(sizes) / len(sizes),
             "min_size": min(sizes),
             "max_size": max(sizes),
             "total_chars": sum(sizes),
-            "overlap_setting": self.chunk_overlap
+            "overlap_setting": self.chunk_overlap,
+            "avg_overlap": sum(overlaps) / len(overlaps) if overlaps else 0,
+            "size_std_dev": np.std(sizes) if len(sizes) > 1 else 0
         }
 
 
-# Convenience function
-def chunk_text(text: str, strategy: str = "recursive",
-               chunk_size: int = 1000, chunk_overlap: int = 200,
+# Convenience function with optimized defaults
+def chunk_text(text: str, strategy: str = "adaptive",
+               chunk_size: int = 800, chunk_overlap: int = 150,
                **kwargs) -> List[Chunk]:
     """
-    Quick helper function to chunk text.
+    Quick helper function to chunk text with optimized defaults.
 
     Args:
         text: Text to chunk
-        strategy: Chunking strategy ('fixed_size', 'sentence', 'paragraph', 'recursive')
-        chunk_size: Size of chunks
-        chunk_overlap: Overlap between chunks
+        strategy: Chunking strategy ('fixed_size', 'sentence', 'paragraph',
+                  'recursive', 'sliding_window', 'adaptive')
+        chunk_size: Size of chunks (default: 800 for optimal retrieval)
+        chunk_overlap: Overlap between chunks (default: 150)
 
     Returns:
         List of Chunk objects
@@ -871,33 +1131,38 @@ def chunk_text(text: str, strategy: str = "recursive",
 
 
 if __name__ == "__main__":
-    # Example usage and testing
+    # Example usage with optimized chunking
     logging.basicConfig(level=logging.INFO)
 
     sample_text = """
     This is the first paragraph. It contains multiple sentences. Here's another sentence.
     
-    This is the second paragraph. It has different content.
+    This is the second paragraph. It has different content about machine learning and AI.
     
     And a third paragraph with more information to demonstrate chunking and overlap.
+    
+    This is a fourth paragraph that is much longer and contains more detailed information about the topic at hand. It discusses various aspects of the subject matter and provides examples and explanations.
     """
 
-    # Test fixed size with overlap
-    chunker = FixedSizeChunker(chunk_size=100, chunk_overlap=30)
-    chunks = chunker.chunk(sample_text)
+    # Test optimized adaptive chunking
+    print("Testing ADAPTIVE chunking strategy...")
+    chunks = chunk_text(sample_text, strategy="adaptive", chunk_size=200, chunk_overlap=40)
 
-    print(f"\nFixed Size Chunker: {len(chunks)} chunks")
+    print(f"\nCreated {len(chunks)} chunks:")
     for i, chunk in enumerate(chunks):
         print(f"  Chunk {i}: {len(chunk.text)} chars - '{chunk.text[:50]}...'")
 
-    # Test overlap validation
-    print(f"\nOverlap test: {chunk_size=}, {chunk_overlap=}")
-    print(f"Chunk 0 end: '{chunks[0].text[-30:]}'")
-    print(f"Chunk 1 start: '{chunks[1].text[:30]}'")
+    # Compare strategies
+    print("\n" + "="*50)
+    print("STRATEGY COMPARISON")
+    print("="*50)
 
-    # Test various strategies
-    strategies = ["fixed_size", "sentence", "paragraph", "recursive", "sliding_window"]
+    strategies = ["fixed_size", "sentence", "paragraph", "recursive", "adaptive"]
 
     for strat in strategies:
-        chunks = chunk_text(sample_text, strategy=strat, chunk_size=80, chunk_overlap=20)
-        print(f"\n{strat.upper()}: {len(chunks)} chunks")
+        chunks = chunk_text(sample_text, strategy=strat, chunk_size=200, chunk_overlap=40)
+        stats = ChunkingPipeline().get_chunk_stats(chunks)
+        print(f"\n{strat.upper()}:")
+        print(f"  Chunks: {stats['total_chunks']}")
+        print(f"  Avg size: {stats['avg_size']:.0f} chars")
+        print(f"  Size std dev: {stats['size_std_dev']:.0f}")

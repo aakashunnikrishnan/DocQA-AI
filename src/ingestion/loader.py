@@ -1,6 +1,6 @@
 """
-Document loader module with support for multiple file formats including PDF.
-IMPROVED: Enhanced error handling, retry logic, and graceful degradation.
+Document loader module with support for multiple file formats including PDF and DOCX.
+IMPROVED: Enhanced DOCX support with table extraction, header preservation, and metadata.
 """
 
 import os
@@ -11,9 +11,15 @@ from pathlib import Path
 from abc import ABC, abstractmethod
 from functools import wraps
 from enum import Enum
+from dataclasses import dataclass
 
 import PyPDF2
 from docx import Document
+from docx.text.paragraph import Paragraph
+from docx.table import Table, _Cell
+from docx.oxml.text.paragraph import CT_P
+from docx.oxml.table import CT_Tbl
+from docx.oxml import parse_xml
 from bs4 import BeautifulSoup
 import markdown
 import csv
@@ -21,6 +27,20 @@ import json
 import chardet
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class LoaderResult:
+    """Result object for loader operations."""
+    success: bool
+    content: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+    file_path: Optional[str] = None
+    file_size: int = 0
+    processing_time_ms: float = 0.0
+    warnings: List[str] = field(default_factory=list)
 
 
 class LoaderError(Exception):
@@ -48,7 +68,7 @@ class ParsingError(LoaderError):
     pass
 
 
-class LoaderErrorCode(Enum):
+class LoaderErrorCode:
     """Error codes for loader operations."""
     SUCCESS = "SUCCESS"
     FILE_NOT_FOUND = "FILE_NOT_FOUND"
@@ -60,32 +80,6 @@ class LoaderErrorCode(Enum):
     EMPTY_FILE = "EMPTY_FILE"
     TIMEOUT = "TIMEOUT"
     UNKNOWN_ERROR = "UNKNOWN_ERROR"
-
-
-@dataclass
-class LoaderResult:
-    """Result object for loader operations."""
-    success: bool
-    content: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
-    error_code: Optional[LoaderErrorCode] = None
-    error_message: Optional[str] = None
-    file_path: Optional[str] = None
-    file_size: int = 0
-    processing_time_ms: float = 0.0
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
-        return {
-            "success": self.success,
-            "content": self.content,
-            "metadata": self.metadata,
-            "error_code": self.error_code.value if self.error_code else None,
-            "error_message": self.error_message,
-            "file_path": self.file_path,
-            "file_size": self.file_size,
-            "processing_time_ms": self.processing_time_ms
-        }
 
 
 def handle_loader_errors(default_return: Any = None, retry_count: int = 3, retry_delay: float = 1.0):
@@ -116,24 +110,24 @@ def handle_loader_errors(default_return: Any = None, retry_count: int = 3, retry
                 except FileNotFoundError as e:
                     logger.error(f"File not found: {e}")
                     last_error = e
-                    break  # Don't retry file not found
+                    break
 
                 except UnsupportedFormatError as e:
                     logger.error(f"Unsupported format: {e}")
                     last_error = e
-                    break  # Don't retry unsupported format
+                    break
 
                 except PermissionError as e:
                     logger.error(f"Permission denied: {e}")
                     last_error = e
-                    break  # Don't retry permission errors
+                    break
 
                 except (CorruptedFileError, ParsingError, UnicodeDecodeError) as e:
                     logger.warning(f"Attempt {attempt + 1}/{retry_count} failed: {e}")
                     last_error = e
 
                     if attempt < retry_count - 1:
-                        time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+                        time.sleep(retry_delay * (attempt + 1))
 
                 except Exception as e:
                     logger.error(f"Unexpected error: {e}", exc_info=True)
@@ -142,7 +136,6 @@ def handle_loader_errors(default_return: Any = None, retry_count: int = 3, retry
                     if attempt < retry_count - 1:
                         time.sleep(retry_delay)
 
-            # Return default value on error
             if isinstance(default_return, LoaderResult) or default_return is None:
                 return LoaderResult(
                     success=False,
@@ -159,13 +152,6 @@ class BaseLoader(ABC):
     """Abstract base class for document loaders."""
 
     def __init__(self, timeout: int = 30, max_file_size_mb: int = 100):
-        """
-        Initialize base loader.
-
-        Args:
-            timeout: Maximum time in seconds for loading operations
-            max_file_size_mb: Maximum file size in MB
-        """
         self.timeout = timeout
         self.max_file_size_mb = max_file_size_mb
 
@@ -179,24 +165,16 @@ class BaseLoader(ABC):
         """Extract metadata from document."""
         pass
 
-    def validate_file(self, file_path: str) -> Tuple[bool, Optional[LoaderErrorCode], Optional[str]]:
-        """
-        Validate file before loading.
-
-        Returns:
-            Tuple of (is_valid, error_code, error_message)
-        """
+    def validate_file(self, file_path: str) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Validate file before loading."""
         path = Path(file_path)
 
-        # Check if file exists
         if not path.exists():
             return False, LoaderErrorCode.FILE_NOT_FOUND, f"File not found: {file_path}"
 
-        # Check if it's a file (not directory)
         if not path.is_file():
             return False, LoaderErrorCode.UNKNOWN_ERROR, f"Path is not a file: {file_path}"
 
-        # Check file size
         file_size = path.stat().st_size
         max_size_bytes = self.max_file_size_mb * 1024 * 1024
 
@@ -206,7 +184,6 @@ class BaseLoader(ABC):
         if file_size > max_size_bytes:
             return False, LoaderErrorCode.UNKNOWN_ERROR, f"File too large: {file_size} bytes (max {max_size_bytes})"
 
-        # Check read permission
         if not os.access(file_path, os.R_OK):
             return False, LoaderErrorCode.PERMISSION_DENIED, f"No read permission: {file_path}"
 
@@ -214,12 +191,11 @@ class BaseLoader(ABC):
 
 
 class PDFLoader(BaseLoader):
-    """Loader for PDF documents with improved error handling."""
+    """Loader for PDF documents."""
 
     @handle_loader_errors()
     def load(self, file_path: str) -> LoaderResult:
-        """Extract text from PDF file with error handling."""
-        # Validate file
+        """Extract text from PDF file."""
         is_valid, error_code, error_msg = self.validate_file(file_path)
         if not is_valid:
             return LoaderResult(
@@ -230,12 +206,12 @@ class PDFLoader(BaseLoader):
             )
 
         text_content = []
+        warnings = []
         metadata = self.get_metadata(file_path)
         file_size = Path(file_path).stat().st_size
 
         try:
             with open(file_path, 'rb') as file:
-                # Check if file is valid PDF
                 try:
                     pdf_reader = PyPDF2.PdfReader(file)
                 except Exception as e:
@@ -244,16 +220,15 @@ class PDFLoader(BaseLoader):
                 if len(pdf_reader.pages) == 0:
                     raise ParsingError("PDF has no pages")
 
-                # Extract text from each page
                 for page_num, page in enumerate(pdf_reader.pages, 1):
                     try:
                         text = page.extract_text()
                         if text and text.strip():
                             text_content.append(f"[Page {page_num}]\n{text}")
                         else:
-                            logger.debug(f"No text found on page {page_num} of {file_path}")
+                            warnings.append(f"No text found on page {page_num}")
                     except Exception as e:
-                        logger.warning(f"Failed to extract page {page_num} from {file_path}: {e}")
+                        warnings.append(f"Failed to extract page {page_num}: {e}")
                         continue
 
                 if not text_content:
@@ -271,11 +246,12 @@ class PDFLoader(BaseLoader):
             content=content,
             metadata=metadata,
             file_path=file_path,
-            file_size=file_size
+            file_size=file_size,
+            warnings=warnings
         )
 
     def get_metadata(self, file_path: str) -> Dict[str, Any]:
-        """Extract PDF metadata with error handling."""
+        """Extract PDF metadata."""
         metadata = {
             "file_path": file_path,
             "file_type": "pdf",
@@ -308,11 +284,39 @@ class PDFLoader(BaseLoader):
 
 
 class DOCXLoader(BaseLoader):
-    """Loader for DOCX documents with improved error handling."""
+    """
+    Enhanced loader for DOCX documents with full support for:
+    - Text extraction with formatting preservation
+    - Table extraction with structure preservation
+    - Header/footer extraction
+    - List detection and formatting
+    - Metadata extraction
+    - Image placeholder handling
+    """
+
+    def __init__(self, timeout: int = 30, max_file_size_mb: int = 100,
+                 extract_tables: bool = True, extract_headers: bool = True,
+                 preserve_formatting: bool = True, extract_lists: bool = True):
+        """
+        Initialize DOCX loader.
+
+        Args:
+            timeout: Maximum time in seconds for loading operations
+            max_file_size_mb: Maximum file size in MB
+            extract_tables: Whether to extract table content
+            extract_headers: Whether to extract headers/footers
+            preserve_formatting: Whether to preserve formatting (bold, italic)
+            extract_lists: Whether to detect and format lists
+        """
+        super().__init__(timeout, max_file_size_mb)
+        self.extract_tables = extract_tables
+        self.extract_headers = extract_headers
+        self.preserve_formatting = preserve_formatting
+        self.extract_lists = extract_lists
 
     @handle_loader_errors()
     def load(self, file_path: str) -> LoaderResult:
-        """Extract text from DOCX file with error handling."""
+        """Extract text from DOCX file with enhanced features."""
         is_valid, error_code, error_msg = self.validate_file(file_path)
         if not is_valid:
             return LoaderResult(
@@ -323,6 +327,7 @@ class DOCXLoader(BaseLoader):
             )
 
         text_content = []
+        warnings = []
         metadata = self.get_metadata(file_path)
         file_size = Path(file_path).stat().st_size
 
@@ -332,43 +337,290 @@ class DOCXLoader(BaseLoader):
             except Exception as e:
                 raise CorruptedFileError(f"Failed to open DOCX file: {e}")
 
-            # Extract paragraphs
-            paragraph_count = 0
-            for paragraph in doc.paragraphs:
-                if paragraph.text and paragraph.text.strip():
-                    text_content.append(paragraph.text)
-                    paragraph_count += 1
+            # Extract metadata
+            metadata = self._extract_docx_metadata(doc, file_path, file_size)
+
+            # Extract headers
+            if self.extract_headers:
+                header_text = self._extract_headers(doc)
+                if header_text:
+                    text_content.append("=== HEADERS ===\n" + header_text)
+                    metadata["has_headers"] = True
+
+            # Extract main content with formatting
+            content_parts = self._extract_paragraphs(doc)
+            text_content.extend(content_parts)
 
             # Extract tables
-            for table in doc.tables:
-                for row in table.rows:
-                    row_text = []
-                    for cell in row.cells:
-                        if cell.text and cell.text.strip():
-                            row_text.append(cell.text.strip())
-                    if row_text:
-                        text_content.append(" | ".join(row_text))
+            if self.extract_tables and doc.tables:
+                table_texts = self._extract_tables(doc.tables)
+                if table_texts:
+                    text_content.append("\n=== TABLES ===\n")
+                    text_content.extend(table_texts)
+                    metadata["num_tables"] = len(doc.tables)
+
+            # Extract footers
+            if self.extract_headers:
+                footer_text = self._extract_footers(doc)
+                if footer_text:
+                    text_content.append("\n=== FOOTERS ===\n" + footer_text)
+                    metadata["has_footers"] = True
 
             if not text_content:
                 raise ParsingError("No text content extracted from DOCX")
 
-            metadata["num_paragraphs"] = paragraph_count
-            metadata["num_tables"] = len(doc.tables)
+            # Combine content
+            content = "\n\n".join(text_content)
+
+            # Additional metadata
+            metadata["num_paragraphs"] = len(doc.paragraphs)
+            metadata["num_sections"] = len(doc.sections) if hasattr(doc, 'sections') else 0
+
+            return LoaderResult(
+                success=True,
+                content=content,
+                metadata=metadata,
+                file_path=file_path,
+                file_size=file_size,
+                warnings=warnings
+            )
 
         except CorruptedFileError:
             raise
         except Exception as e:
             raise ParsingError(f"Failed to load DOCX: {e}")
 
-        content = "\n\n".join(text_content)
+    def _extract_docx_metadata(self, doc: Document, file_path: str, file_size: int) -> Dict[str, Any]:
+        """Extract DOCX metadata including core properties and custom properties."""
+        metadata = {
+            "file_path": file_path,
+            "file_type": "docx",
+            "file_size": file_size,
+            "num_paragraphs": len(doc.paragraphs),
+            "num_tables": len(doc.tables),
+            "num_sections": len(doc.sections) if hasattr(doc, 'sections') else 0,
+            "author": None,
+            "title": None,
+            "subject": None,
+            "keywords": None,
+            "category": None,
+            "comments": None,
+            "created": None,
+            "modified": None,
+            "last_modified_by": None,
+            "revision": None
+        }
 
-        return LoaderResult(
-            success=True,
-            content=content,
-            metadata=metadata,
-            file_path=file_path,
-            file_size=file_size
-        )
+        try:
+            if doc.core_properties:
+                cp = doc.core_properties
+                metadata["author"] = str(cp.author) if cp.author else None
+                metadata["title"] = str(cp.title) if cp.title else None
+                metadata["subject"] = str(cp.subject) if cp.subject else None
+                metadata["keywords"] = str(cp.keywords) if cp.keywords else None
+                metadata["category"] = str(cp.category) if cp.category else None
+                metadata["comments"] = str(cp.comments) if cp.comments else None
+                metadata["created"] = str(cp.created) if cp.created else None
+                metadata["modified"] = str(cp.modified) if cp.modified else None
+                metadata["last_modified_by"] = str(cp.last_modified_by) if cp.last_modified_by else None
+                metadata["revision"] = str(cp.revision) if cp.revision else None
+
+        except Exception as e:
+            logger.warning(f"Failed to extract core properties from {file_path}: {e}")
+
+        # Try to extract custom properties
+        try:
+            if hasattr(doc, 'custom_properties'):
+                custom_props = {}
+                for prop in doc.custom_properties:
+                    custom_props[prop.name] = prop.value
+                if custom_props:
+                    metadata["custom_properties"] = custom_props
+        except Exception as e:
+            logger.warning(f"Failed to extract custom properties: {e}")
+
+        return metadata
+
+    def _extract_paragraphs(self, doc: Document) -> List[str]:
+        """Extract paragraphs with formatting and list detection."""
+        content_parts = []
+        list_counter = 0
+        in_list = False
+        list_type = None  # 'bullet' or 'numbered'
+
+        for para in doc.paragraphs:
+            if not para.text or not para.text.strip():
+                continue
+
+            # Check if paragraph is a heading
+            if self._is_heading(para):
+                # Format heading
+                heading_level = self._get_heading_level(para)
+                content_parts.append(f"\n{'#' * heading_level} {para.text.strip()}")
+                in_list = False
+                list_counter = 0
+                continue
+
+            # Check if paragraph is in a list
+            if self.extract_lists and self._is_list_item(para):
+                list_item_type = self._get_list_type(para)
+
+                if not in_list or list_item_type != list_type:
+                    in_list = True
+                    list_type = list_item_type
+                    list_counter = 1
+
+                # Format list item
+                if list_type == 'bullet':
+                    content_parts.append(f"  • {para.text.strip()}")
+                elif list_type == 'numbered':
+                    content_parts.append(f"  {list_counter}. {para.text.strip()}")
+                    list_counter += 1
+                continue
+            else:
+                if in_list:
+                    in_list = False
+                    list_counter = 0
+                    list_type = None
+
+            # Regular paragraph with formatting
+            formatted_text = self._format_paragraph_text(para)
+            content_parts.append(formatted_text)
+
+        return content_parts
+
+    def _format_paragraph_text(self, para: Paragraph) -> str:
+        """Format paragraph text with formatting preservation."""
+        if not self.preserve_formatting:
+            return para.text.strip()
+
+        # Extract runs with formatting
+        formatted_parts = []
+        for run in para.runs:
+            text = run.text
+            if not text:
+                continue
+
+            # Apply formatting
+            if run.bold:
+                text = f"**{text}**"
+            if run.italic:
+                text = f"*{text}*"
+            if run.underline:
+                text = f"_{text}_"
+
+            formatted_parts.append(text)
+
+        return ''.join(formatted_parts).strip()
+
+    def _is_heading(self, para: Paragraph) -> bool:
+        """Check if paragraph is a heading."""
+        if para.style and para.style.name:
+            return 'heading' in para.style.name.lower()
+        return False
+
+    def _get_heading_level(self, para: Paragraph) -> int:
+        """Get heading level from paragraph style."""
+        if not para.style or not para.style.name:
+            return 1
+
+        # Extract number from "Heading 1", "Heading 2", etc.
+        import re
+        match = re.search(r'heading\s*(\d+)', para.style.name.lower())
+        if match:
+            return min(int(match.group(1)), 6)  # Max heading level 6
+
+        return 1
+
+    def _is_list_item(self, para: Paragraph) -> bool:
+        """Check if paragraph is a list item."""
+        if para.style and para.style.name:
+            style_name = para.style.name.lower()
+            if 'list' in style_name or 'bullet' in style_name:
+                return True
+
+        # Check for list numbering in paragraph text
+        if re.match(r'^[\s]*[•●○■▪▫]', para.text):
+            return True
+        if re.match(r'^[\s]*\d+[\.\)]', para.text):
+            return True
+        if re.match(r'^[\s]*[a-zA-Z][\.\)]', para.text):
+            return True
+
+        return False
+
+    def _get_list_type(self, para: Paragraph) -> str:
+        """Determine list type (bullet or numbered)."""
+        if para.style and para.style.name:
+            style_name = para.style.name.lower()
+            if 'bullet' in style_name:
+                return 'bullet'
+            if 'number' in style_name or 'enum' in style_name:
+                return 'numbered'
+
+        # Check text pattern
+        if re.match(r'^[\s]*[•●○■▪▫]', para.text):
+            return 'bullet'
+        if re.match(r'^[\s]*\d+[\.\)]', para.text):
+            return 'numbered'
+
+        return 'bullet'  # Default
+
+    def _extract_tables(self, tables: List[Table]) -> List[str]:
+        """Extract tables with structure preservation."""
+        table_texts = []
+
+        for table_idx, table in enumerate(tables, 1):
+            table_lines = []
+            table_lines.append(f"Table {table_idx}:")
+
+            # Extract headers (first row)
+            if table.rows:
+                header_row = table.rows[0]
+                headers = [cell.text.strip() for cell in header_row.cells]
+                if headers:
+                    table_lines.append("  " + " | ".join(headers))
+                    table_lines.append("  " + "-" * (sum(len(h) for h in headers) + len(headers) * 3))
+
+            # Extract data rows
+            for row_idx, row in enumerate(table.rows[1:], 1):
+                cells = [cell.text.strip() for cell in row.cells]
+                if any(cells):  # Only add non-empty rows
+                    table_lines.append(f"  Row {row_idx}: " + " | ".join(cells))
+
+            table_texts.append("\n".join(table_lines))
+
+        return table_texts
+
+    def _extract_headers(self, doc: Document) -> str:
+        """Extract header content from document."""
+        header_texts = []
+
+        try:
+            for section in doc.sections:
+                if section.header:
+                    for para in section.header.paragraphs:
+                        if para.text and para.text.strip():
+                            header_texts.append(para.text.strip())
+        except Exception as e:
+            logger.warning(f"Failed to extract headers: {e}")
+
+        return "\n".join(header_texts) if header_texts else ""
+
+    def _extract_footers(self, doc: Document) -> str:
+        """Extract footer content from document."""
+        footer_texts = []
+
+        try:
+            for section in doc.sections:
+                if section.footer:
+                    for para in section.footer.paragraphs:
+                        if para.text and para.text.strip():
+                            footer_texts.append(para.text.strip())
+        except Exception as e:
+            logger.warning(f"Failed to extract footers: {e}")
+
+        return "\n".join(footer_texts) if footer_texts else ""
 
     def get_metadata(self, file_path: str) -> Dict[str, Any]:
         """Extract DOCX metadata with error handling."""
@@ -378,20 +630,28 @@ class DOCXLoader(BaseLoader):
             "file_size": Path(file_path).stat().st_size,
             "num_paragraphs": 0,
             "num_tables": 0,
+            "num_sections": 0,
             "author": None,
             "title": None,
             "subject": None,
-            "keywords": None
+            "keywords": None,
+            "category": None
         }
 
         try:
             doc = Document(file_path)
 
             if doc.core_properties:
-                metadata["author"] = str(doc.core_properties.author) if doc.core_properties.author else None
-                metadata["title"] = str(doc.core_properties.title) if doc.core_properties.title else None
-                metadata["subject"] = str(doc.core_properties.subject) if doc.core_properties.subject else None
-                metadata["keywords"] = str(doc.core_properties.keywords) if doc.core_properties.keywords else None
+                cp = doc.core_properties
+                metadata["author"] = str(cp.author) if cp.author else None
+                metadata["title"] = str(cp.title) if cp.title else None
+                metadata["subject"] = str(cp.subject) if cp.subject else None
+                metadata["keywords"] = str(cp.keywords) if cp.keywords else None
+                metadata["category"] = str(cp.category) if cp.category else None
+
+            metadata["num_paragraphs"] = len(doc.paragraphs)
+            metadata["num_tables"] = len(doc.tables)
+            metadata["num_sections"] = len(doc.sections) if hasattr(doc, 'sections') else 0
 
         except Exception as e:
             logger.warning(f"Failed to extract metadata from {file_path}: {e}")
@@ -406,7 +666,7 @@ class TextLoader(BaseLoader):
         """Detect file encoding."""
         try:
             with open(file_path, 'rb') as file:
-                raw_data = file.read(10000)  # Read first 10KB for detection
+                raw_data = file.read(10000)
                 result = chardet.detect(raw_data)
                 return result.get('encoding', 'utf-8')
         except Exception:
@@ -451,6 +711,9 @@ class TextLoader(BaseLoader):
         if not content.strip():
             raise ParsingError("File contains no text content")
 
+        # Count lines
+        metadata["line_count"] = len(content.splitlines())
+
         return LoaderResult(
             success=True,
             content=content,
@@ -470,121 +733,36 @@ class TextLoader(BaseLoader):
         }
 
 
-class HTMLLoader(BaseLoader):
-    """Loader for HTML documents with improved error handling."""
-
-    @handle_loader_errors()
-    def load(self, file_path: str) -> LoaderResult:
-        """Extract text from HTML file with error handling."""
-        is_valid, error_code, error_msg = self.validate_file(file_path)
-        if not is_valid:
-            return LoaderResult(
-                success=False,
-                error_code=error_code,
-                error_message=error_msg,
-                file_path=file_path
-            )
-
-        metadata = self.get_metadata(file_path)
-        file_size = Path(file_path).stat().st_size
-
-        try:
-            # Try multiple encodings
-            content = None
-            for encoding in ['utf-8', 'latin-1', 'cp1252']:
-                try:
-                    with open(file_path, 'r', encoding=encoding) as file:
-                        html_content = file.read()
-                        content = self._extract_text_from_html(html_content)
-                        if content and content.strip():
-                            break
-                except UnicodeDecodeError:
-                    continue
-
-            if content is None or not content.strip():
-                raise ParsingError("No text content extracted from HTML")
-
-        except Exception as e:
-            raise ParsingError(f"Failed to load HTML: {e}")
-
-        return LoaderResult(
-            success=True,
-            content=content,
-            metadata=metadata,
-            file_path=file_path,
-            file_size=file_size
-        )
-
-    def _extract_text_from_html(self, html_content: str) -> str:
-        """Extract text from HTML content."""
-        try:
-            soup = BeautifulSoup(html_content, 'html.parser')
-
-            # Remove script and style elements
-            for element in soup(["script", "style", "nav", "footer", "header"]):
-                element.decompose()
-
-            # Get text
-            text = soup.get_text()
-
-            # Clean up whitespace
-            lines = (line.strip() for line in text.splitlines())
-            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-            text = '\n'.join(chunk for chunk in chunks if chunk)
-
-            return text
-
-        except Exception as e:
-            raise ParsingError(f"Failed to parse HTML: {e}")
-
-    def get_metadata(self, file_path: str) -> Dict[str, Any]:
-        """Extract HTML metadata with error handling."""
-        metadata = {
-            "file_path": file_path,
-            "file_type": "html",
-            "file_size": Path(file_path).stat().st_size,
-            "title": None,
-            "description": None,
-            "keywords": None
-        }
-
-        try:
-            with open(file_path, 'r', encoding='utf-8') as file:
-                soup = BeautifulSoup(file.read(), 'html.parser')
-
-                if soup.title:
-                    metadata["title"] = soup.title.string
-
-                # Extract meta tags
-                for meta in soup.find_all('meta'):
-                    if meta.get('name') == 'description':
-                        metadata["description"] = meta.get('content')
-                    elif meta.get('name') == 'keywords':
-                        metadata["keywords"] = meta.get('content')
-
-        except Exception as e:
-            logger.warning(f"Failed to extract metadata from {file_path}: {e}")
-
-        return metadata
-
-
 class DocumentLoader:
     """Main document loader that routes to appropriate loader based on file extension."""
 
-    def __init__(self, timeout: int = 30, max_file_size_mb: int = 100):
+    def __init__(self, timeout: int = 30, max_file_size_mb: int = 100,
+                 extract_tables: bool = True, extract_headers: bool = True,
+                 preserve_formatting: bool = True, extract_lists: bool = True):
         """
         Initialize document loader.
 
         Args:
             timeout: Maximum time in seconds for loading operations
             max_file_size_mb: Maximum file size in MB
+            extract_tables: Whether to extract tables from DOCX
+            extract_headers: Whether to extract headers/footers
+            preserve_formatting: Whether to preserve formatting
+            extract_lists: Whether to detect and format lists
         """
         self.timeout = timeout
         self.max_file_size_mb = max_file_size_mb
 
         self.loaders = {
             '.pdf': PDFLoader(timeout=timeout, max_file_size_mb=max_file_size_mb),
-            '.docx': DOCXLoader(timeout=timeout, max_file_size_mb=max_file_size_mb),
+            '.docx': DOCXLoader(
+                timeout=timeout,
+                max_file_size_mb=max_file_size_mb,
+                extract_tables=extract_tables,
+                extract_headers=extract_headers,
+                preserve_formatting=preserve_formatting,
+                extract_lists=extract_lists
+            ),
             '.txt': TextLoader(timeout=timeout, max_file_size_mb=max_file_size_mb),
             '.html': HTMLLoader(timeout=timeout, max_file_size_mb=max_file_size_mb),
             '.htm': HTMLLoader(timeout=timeout, max_file_size_mb=max_file_size_mb),
@@ -621,13 +799,11 @@ class DocumentLoader:
 
         file_path = Path(file_path)
 
-        # Check if file exists
         if not file_path.exists():
             self.stats["failed_loads"] += 1
             self._record_error("file_not_found")
             raise FileNotFoundError(f"File not found: {file_path}")
 
-        # Get loader based on extension
         extension = file_path.suffix.lower()
         loader = self.loaders.get(extension)
 
@@ -653,11 +829,12 @@ class DocumentLoader:
                     "metadata": result.metadata,
                     "file_path": str(file_path),
                     "file_size": result.file_size,
-                    "processing_time_ms": result.processing_time_ms
+                    "processing_time_ms": result.processing_time_ms,
+                    "warnings": result.warnings
                 }
             else:
                 self.stats["failed_loads"] += 1
-                self._record_error(result.error_code.value if result.error_code else "unknown")
+                self._record_error(result.error_code or "unknown")
 
                 error_msg = f"Failed to load {file_path}: {result.error_message}"
                 logger.error(error_msg)
@@ -675,105 +852,6 @@ class DocumentLoader:
             logger.error(f"Error loading document {file_path}: {e}", exc_info=True)
             raise
 
-    def load_document_safe(self, file_path: str) -> LoaderResult:
-        """
-        Load document safely without raising exceptions.
-
-        Args:
-            file_path: Path to the document file
-
-        Returns:
-            LoaderResult object (always returned, never raises)
-        """
-        try:
-            result = self.load_document(file_path)
-            return LoaderResult(
-                success=True,
-                content=result["content"],
-                metadata=result["metadata"],
-                file_path=result["file_path"],
-                file_size=result["file_size"],
-                processing_time_ms=result["processing_time_ms"]
-            )
-        except FileNotFoundError as e:
-            return LoaderResult(
-                success=False,
-                error_code=LoaderErrorCode.FILE_NOT_FOUND,
-                error_message=str(e),
-                file_path=str(file_path)
-            )
-        except UnsupportedFormatError as e:
-            return LoaderResult(
-                success=False,
-                error_code=LoaderErrorCode.UNSUPPORTED_FORMAT,
-                error_message=str(e),
-                file_path=str(file_path)
-            )
-        except Exception as e:
-            return LoaderResult(
-                success=False,
-                error_code=LoaderErrorCode.UNKNOWN_ERROR,
-                error_message=str(e),
-                file_path=str(file_path)
-            )
-
-    def load_directory(
-        self,
-        directory_path: str,
-        extensions: Optional[List[str]] = None,
-        skip_errors: bool = True
-    ) -> List[Dict[str, Any]]:
-        """
-        Load all documents from a directory.
-
-        Args:
-            directory_path: Path to directory containing documents
-            extensions: List of extensions to filter (e.g., ['.pdf', '.txt'])
-            skip_errors: Whether to skip files that cause errors
-
-        Returns:
-            List of document dictionaries
-        """
-        directory_path = Path(directory_path)
-
-        if not directory_path.exists():
-            raise FileNotFoundError(f"Directory not found: {directory_path}")
-
-        if not directory_path.is_dir():
-            raise NotADirectoryError(f"Path is not a directory: {directory_path}")
-
-        documents = []
-        failed_files = []
-
-        # Default to all supported extensions if not specified
-        if extensions is None:
-            extensions = list(self.loaders.keys())
-
-        total_files = 0
-        for extension in extensions:
-            for file_path in directory_path.glob(f"**/*{extension}"):
-                total_files += 1
-
-                try:
-                    doc = self.load_document(str(file_path))
-                    documents.append(doc)
-                    logger.debug(f"Loaded: {file_path}")
-                except Exception as e:
-                    error_msg = f"Failed to load {file_path}: {e}"
-                    if skip_errors:
-                        logger.warning(error_msg)
-                        failed_files.append(str(file_path))
-                    else:
-                        logger.error(error_msg)
-                        raise
-
-        logger.info(f"Loaded {len(documents)}/{total_files} documents from {directory_path}")
-
-        if failed_files:
-            logger.warning(f"Failed to load {len(failed_files)} files: {failed_files[:5]}...")
-
-        return documents
-
     def _record_error(self, error_type: str):
         """Record error statistics."""
         if error_type not in self.stats["errors_by_type"]:
@@ -790,231 +868,21 @@ class DocumentLoader:
             )
         }
 
-    def reset_stats(self):
-        """Reset statistics."""
-        self.stats = {
-            "total_attempts": 0,
-            "successful_loads": 0,
-            "failed_loads": 0,
-            "errors_by_type": {}
-        }
-
-
-# Add missing loader classes
-class MarkdownLoader(BaseLoader):
-    """Loader for Markdown files."""
-
-    @handle_loader_errors()
-    def load(self, file_path: str) -> LoaderResult:
-        """Convert markdown to text."""
-        is_valid, error_code, error_msg = self.validate_file(file_path)
-        if not is_valid:
-            return LoaderResult(
-                success=False,
-                error_code=error_code,
-                error_message=error_msg,
-                file_path=file_path
-            )
-
-        metadata = self.get_metadata(file_path)
-        file_size = Path(file_path).stat().st_size
-
-        try:
-            with open(file_path, 'r', encoding='utf-8') as file:
-                md_content = file.read()
-                html = markdown.markdown(md_content)
-                soup = BeautifulSoup(html, 'html.parser')
-                content = soup.get_text()
-
-                if not content.strip():
-                    raise ParsingError("No text content extracted from Markdown")
-
-        except Exception as e:
-            raise ParsingError(f"Failed to load Markdown: {e}")
-
-        return LoaderResult(
-            success=True,
-            content=content,
-            metadata=metadata,
-            file_path=file_path,
-            file_size=file_size
-        )
-
-    def get_metadata(self, file_path: str) -> Dict[str, Any]:
-        """Extract markdown metadata."""
-        return {
-            "file_path": file_path,
-            "file_type": "md",
-            "file_size": Path(file_path).stat().st_size
-        }
-
-
-class CSVLoader(BaseLoader):
-    """Loader for CSV files."""
-
-    @handle_loader_errors()
-    def load(self, file_path: str) -> LoaderResult:
-        """Convert CSV to readable text format."""
-        is_valid, error_code, error_msg = self.validate_file(file_path)
-        if not is_valid:
-            return LoaderResult(
-                success=False,
-                error_code=error_code,
-                error_message=error_msg,
-                file_path=file_path
-            )
-
-        text_content = []
-        metadata = self.get_metadata(file_path)
-        file_size = Path(file_path).stat().st_size
-
-        try:
-            with open(file_path, 'r', encoding='utf-8') as file:
-                csv_reader = csv.reader(file)
-                rows = list(csv_reader)
-
-                if not rows:
-                    raise ParsingError("CSV file has no rows")
-
-                headers = rows[0] if rows else []
-                text_content.append("Columns: " + ", ".join(headers))
-
-                for row_num, row in enumerate(rows[1:], 1):
-                    row_text = f"Row {row_num}: " + ", ".join(
-                        f"{headers[i] if i < len(headers) else f'col{i}'}: {val}"
-                        for i, val in enumerate(row)
-                    )
-                    text_content.append(row_text)
-
-                metadata["num_rows"] = len(rows)
-                metadata["num_columns"] = len(headers)
-
-        except Exception as e:
-            raise ParsingError(f"Failed to load CSV: {e}")
-
-        content = "\n".join(text_content)
-
-        return LoaderResult(
-            success=True,
-            content=content,
-            metadata=metadata,
-            file_path=file_path,
-            file_size=file_size
-        )
-
-    def get_metadata(self, file_path: str) -> Dict[str, Any]:
-        """Extract CSV metadata."""
-        metadata = {
-            "file_path": file_path,
-            "file_type": "csv",
-            "file_size": Path(file_path).stat().st_size,
-            "num_rows": 0,
-            "num_columns": 0
-        }
-
-        try:
-            with open(file_path, 'r', encoding='utf-8') as file:
-                csv_reader = csv.reader(file)
-                rows = list(csv_reader)
-                metadata["num_rows"] = len(rows)
-                if rows:
-                    metadata["num_columns"] = len(rows[0])
-
-        except Exception as e:
-            logger.warning(f"Failed to extract metadata from {file_path}: {e}")
-
-        return metadata
-
-
-class JSONLoader(BaseLoader):
-    """Loader for JSON files."""
-
-    @handle_loader_errors()
-    def load(self, file_path: str) -> LoaderResult:
-        """Load and format JSON content."""
-        is_valid, error_code, error_msg = self.validate_file(file_path)
-        if not is_valid:
-            return LoaderResult(
-                success=False,
-                error_code=error_code,
-                error_message=error_msg,
-                file_path=file_path
-            )
-
-        metadata = self.get_metadata(file_path)
-        file_size = Path(file_path).stat().st_size
-
-        try:
-            with open(file_path, 'r', encoding='utf-8') as file:
-                data = json.load(file)
-                content = json.dumps(data, indent=2)
-
-        except json.JSONDecodeError as e:
-            raise ParsingError(f"Invalid JSON format: {e}")
-        except Exception as e:
-            raise ParsingError(f"Failed to load JSON: {e}")
-
-        return LoaderResult(
-            success=True,
-            content=content,
-            metadata=metadata,
-            file_path=file_path,
-            file_size=file_size
-        )
-
-    def get_metadata(self, file_path: str) -> Dict[str, Any]:
-        """Extract JSON metadata."""
-        return {
-            "file_path": file_path,
-            "file_type": "json",
-            "file_size": Path(file_path).stat().st_size
-        }
-
-
-# Convenience function for quick loading
-def load_documents_safe(file_paths: List[str]) -> List[Dict[str, Any]]:
-    """
-    Load multiple documents safely, skipping failed ones.
-
-    Args:
-        file_paths: List of file paths to load
-
-    Returns:
-        List of successfully loaded document dictionaries
-    """
-    loader = DocumentLoader()
-    documents = []
-
-    for file_path in file_paths:
-        result = loader.load_document_safe(file_path)
-        if result.success:
-            documents.append({
-                "content": result.content,
-                "metadata": result.metadata,
-                "file_path": result.file_path,
-                "file_size": result.file_size
-            })
-
-    return documents
-
 
 if __name__ == "__main__":
-    # Example usage
+    # Example usage with DOCX
     logging.basicConfig(level=logging.INFO)
 
-    loader = DocumentLoader()
+    loader = DocumentLoader(
+        extract_tables=True,
+        extract_headers=True,
+        preserve_formatting=True,
+        extract_lists=True
+    )
 
-    # Load a single file safely
-    result = loader.load_document_safe("sample.pdf")
-    if result.success:
-        print(f"Loaded: {len(result.content)} characters")
-    else:
-        print(f"Error: {result.error_message}")
+    # Load a DOCX file
+    # result = loader.load_document("sample.docx")
+    # print(f"Content length: {len(result['content'])}")
+    # print(f"Metadata: {result['metadata']}")
 
-    # Load directory with error handling
-    docs = loader.load_directory("./data/raw/", skip_errors=True)
-    print(f"Loaded {len(docs)} documents")
-
-    # Get statistics
-    stats = loader.get_stats()
-    print(f"Success rate: {stats['success_rate']:.2%}")
+    print("DOCX Loader ready with enhanced features")

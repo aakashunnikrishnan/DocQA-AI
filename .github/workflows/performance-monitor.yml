@@ -1,0 +1,47 @@
+name: Performance Monitoring
+
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: '0 0 * * *'  # Daily at midnight
+
+jobs:
+  performance:
+    name: Performance Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements-dev.txt
+          pip install -e .
+
+      - name: Run performance benchmarks
+        run: |
+          pytest tests/ --benchmark-only --benchmark-json=benchmark-results.json
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmark-results.json
+
+      - name: Compare with baseline
+        run: |
+          python scripts/compare_benchmarks.py benchmark-results.json benchmarks/baseline.json || true
+
+      - name: Store benchmark baseline
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-baseline
+          path: benchmark-results.json

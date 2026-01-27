@@ -1,0 +1,464 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop, feature/* ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    - cron: '0 2 * * *'  # Daily security scan at 2 AM
+
+env:
+  PYTHON_VERSION: '3.10'
+  POETRY_VERSION: '1.7.1'
+
+jobs:
+  # ============================================================================
+  # LINTING & FORMATTING
+  # ============================================================================
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache pip packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements*.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run Black (code formatting)
+        run: black --check src/ tests/ api/ scripts/
+
+      - name: Run isort (import sorting)
+        run: isort --check-only --profile black src/ tests/ api/ scripts/
+
+      - name: Run Ruff (fast linting)
+        run: ruff check src/ tests/ api/ scripts/
+
+      - name: Run Flake8 (comprehensive linting)
+        run: flake8 src/ tests/ api/ scripts/ --count --max-complexity=10 --max-line-length=127 --statistics
+
+      - name: Run mypy (type checking)
+        run: mypy src/ api/ --ignore-missing-imports
+
+      - name: Run bandit (security linting)
+        run: bandit -r src/ api/ -f json -o bandit-report.json || true
+
+      - name: Upload bandit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-report
+          path: bandit-report.json
+
+  # ============================================================================
+  # TESTING
+  # ============================================================================
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-${{ matrix.python-version }}-pip-${{ hashFiles('requirements*.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.python-version }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -e .
+
+      - name: Run pytest with coverage
+        run: |
+          pytest tests/ \
+            --cov=src \
+            --cov=api \
+            --cov-report=xml \
+            --cov-report=html \
+            --cov-report=term-missing \
+            -v \
+            --junitxml=pytest.xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.python-version }}
+          path: |
+            pytest.xml
+            htmlcov/
+
+      - name: Run performance benchmarks
+        run: |
+          pytest tests/ --benchmark-only --benchmark-json=benchmarks.json || true
+
+      - name: Upload benchmarks
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks-${{ matrix.python-version }}
+          path: benchmarks.json
+
+  # ============================================================================
+  # SECURITY SCANNING
+  # ============================================================================
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Run Safety (dependency security)
+        run: |
+          pip install safety
+          safety check -r requirements.txt --full-report
+
+      - name: Run OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'docqa-ai'
+          path: '.'
+          format: 'HTML'
+          out: 'reports'
+
+      - name: Upload dependency check report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: reports
+
+  # ============================================================================
+  # DOCKER BUILD
+  # ============================================================================
+  docker:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [lint, test]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Docker layers
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: false
+          load: true
+          tags: docqa-ai:latest
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new
+
+      - name: Test Docker image
+        run: |
+          docker run --rm docqa-ai:latest python -c "import sys; print('Python version:', sys.version)"
+
+      - name: Scan Docker image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'docqa-ai:latest'
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'
+
+      - name: Move cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+  # ============================================================================
+  # DEPLOYMENT
+  # ============================================================================
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [docker, security]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    environment: staging
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: docqa-ai
+          IMAGE_TAG: staging-${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -f docker/Dockerfile .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      - name: Deploy to ECS
+        run: |
+          aws ecs update-service --cluster docqa-staging --service docqa-api --force-new-deployment
+
+      - name: Verify deployment
+        run: |
+          sleep 30
+          curl -f https://staging.docqa-ai.com/health || exit 1
+
+      - name: Notify Slack
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          fields: repo,message,commit,author,action,eventName,ref,workflow
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        if: always()
+
+  # ============================================================================
+  # DEPLOY TO PRODUCTION (Manual Trigger)
+  # ============================================================================
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [deploy-staging]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: docqa-ai
+          IMAGE_TAG: production-${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -f docker/Dockerfile .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      - name: Deploy to ECS
+        run: |
+          aws ecs update-service --cluster docqa-production --service docqa-api --force-new-deployment
+
+      - name: Run smoke tests
+        run: |
+          sleep 60
+          curl -f https://docqa-ai.com/health || exit 1
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ github.sha }}
+          name: Release ${{ github.sha }}
+          body: |
+            ## Production Release
+            
+            - Commit: ${{ github.sha }}
+            - Deployed: $(date)
+            - Environment: Production
+            
+            ### Changes
+            ${{ github.event.head_commit.message }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ============================================================================
+  # DOCUMENTATION
+  # ============================================================================
+  docs:
+    name: Build Documentation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [lint, test]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install mkdocs mkdocs-material mkdocstrings mkdocs-minify-plugin
+
+      - name: Build documentation
+        run: mkdocs build --strict
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+          destination_dir: docs
+        if: github.ref == 'refs/heads/main'
+
+  # ============================================================================
+  # DEPENDENCY UPDATES (Weekly)
+  # ============================================================================
+  dependency-update:
+    name: Dependency Updates
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'schedule'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install pip-tools
+        run: pip install pip-tools
+
+      - name: Update dependencies
+        run: |
+          pip-compile --upgrade requirements.in -o requirements.txt
+          pip-compile --upgrade requirements-dev.in -o requirements-dev.txt
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: 'chore(deps): update dependencies'
+          title: 'chore(deps): update dependencies'
+          body: |
+            This PR updates dependencies to their latest versions.
+            
+            ## Changes
+            - Updated requirements.txt
+            - Updated requirements-dev.txt
+            
+            Please review and test before merging.
+          branch: chore/dependency-updates
+          base: develop
+          labels: dependencies, automated
+
+  # ============================================================================
+  # NOTIFICATIONS
+  # ============================================================================
+  notify:
+    name: Notify Status
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [lint, test, security, docker]
+    if: always()
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Notify Slack
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ needs.lint.result }}
+          fields: repo,message,commit,author,action,eventName,ref,workflow
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        if: always()
+
+      - name: Notify on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `CI Failed: ${context.workflow} - ${context.sha}`,
+              body: `The CI pipeline has failed.\n\nWorkflow: ${context.workflow}\nCommit: ${context.sha}\nLink: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              labels: ['bug', 'ci-failure']
+            })

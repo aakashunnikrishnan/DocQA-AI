@@ -1,31 +1,35 @@
 """
-API routes for DocQA AI system.
+API routes for DocQA AI system with async support.
 Handles document ingestion, querying, and management endpoints.
 """
 
 import os
 import json
 import asyncio
+import time
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from pathlib import Path
 import tempfile
 import shutil
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Query, Request, status
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Query, Request, status, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, validator
 
-from api.app import get_app_state
+from api.app import get_app_state, task_manager
 from api.schemas import (
     QueryRequest, QueryResponse, DocumentIngestRequest,
     DocumentIngestResponse, DocumentListResponse, DocumentInfo,
-    HealthResponse, MetricsResponse, ErrorResponse
+    HealthResponse, MetricsResponse, ErrorResponse, TaskStatusResponse
 )
+from api.background import process_ingestion_task
 from src.utils.logger import get_logger
+from src.utils.cache import async_cached
 from src.ingestion.loader import DocumentLoader
 from src.ingestion.chunker import ChunkingPipeline
-from src.ingestion.embedding_generator import EmbeddingGeneratorPipeline
+from src.ingestion.embedding_generator import BatchEmbeddingGenerator
 from src.retrieval.retriever import RetrievalResult
 from src.generation.prompt_templates import get_rag_prompt
 from src.generation.response_postprocess import postprocess_response
@@ -36,85 +40,18 @@ logger = get_logger(__name__)
 router = APIRouter(tags=["docqa"])
 
 
-# ============== Request/Response Models ==============
+# ============== Async Helper Functions ==============
 
-class QueryRequest(BaseModel):
-    """Request model for query endpoint."""
-    question: str = Field(..., description="Question to ask", min_length=1, max_length=1000)
-    top_k: int = Field(5, description="Number of documents to retrieve", ge=1, le=50)
-    stream: bool = Field(False, description="Stream the response")
-    include_sources: bool = Field(True, description="Include source citations")
-    temperature: Optional[float] = Field(None, description="LLM temperature", ge=0, le=2)
-    max_tokens: Optional[int] = Field(None, description="Max tokens for response", ge=1, le=4096)
-
-    @validator('question')
-    def validate_question(cls, v):
-        if not v.strip():
-            raise ValueError("Question cannot be empty")
-        return v.strip()
-
-
-class QueryResponse(BaseModel):
-    """Response model for query endpoint."""
-    answer: str = Field(..., description="Generated answer")
-    confidence: float = Field(..., description="Confidence score", ge=0, le=1)
-    sources: List[Dict[str, Any]] = Field(default_factory=list, description="Source documents")
-    processing_time_ms: float = Field(..., description="Processing time in milliseconds")
-    tokens_used: int = Field(0, description="Total tokens used")
-    has_hallucination: bool = Field(False, description="Whether hallucination was detected")
-
-
-class DocumentIngestRequest(BaseModel):
-    """Request model for document ingestion."""
-    chunk_size: Optional[int] = Field(None, description="Chunk size in characters", ge=100, le=10000)
-    chunk_overlap: Optional[int] = Field(None, description="Chunk overlap in characters", ge=0, le=5000)
-    chunking_strategy: Optional[str] = Field("recursive", description="Chunking strategy")
-
-
-class DocumentIngestResponse(BaseModel):
-    """Response model for document ingestion."""
-    success: bool
-    document_ids: List[str]
-    total_chunks: int
-    total_documents: int
-    processing_time_seconds: float
-    failed_files: List[str] = Field(default_factory=list)
-
-
-class DocumentListResponse(BaseModel):
-    """Response model for document listing."""
-    documents: List[Dict[str, Any]]
-    total: int
-
-
-class DocumentInfo(BaseModel):
-    """Document information model."""
-    id: str
-    name: str
-    size_bytes: int
-    file_type: str
-    ingested_at: str
-    chunk_count: int
-    metadata: Dict[str, Any] = Field(default_factory=dict)
-
-
-# ============== Helper Functions ==============
-
-def get_state():
-    """Get application state."""
-    return get_app_state()
-
-
-async def process_ingestion(
+async def process_ingestion_async(
     files: List[UploadFile],
-    chunk_size: int = 1000,
-    chunk_overlap: int = 200,
-    chunking_strategy: str = "recursive"
+    chunk_size: int = 800,
+    chunk_overlap: int = 150,
+    chunking_strategy: str = "adaptive"
 ) -> DocumentIngestResponse:
     """
-    Process document ingestion.
+    Process document ingestion asynchronously.
     """
-    state = get_state()
+    state = get_app_state()
     loader = DocumentLoader()
 
     # Create temporary directory for uploaded files
@@ -122,26 +59,18 @@ async def process_ingestion(
         uploaded_files = []
         failed_files = []
 
-        # Save uploaded files
+        # Save uploaded files in parallel
+        save_tasks = []
         for file in files:
-            file_path = Path(temp_dir) / file.filename
+            save_tasks.append(_save_uploaded_file(file, temp_dir))
 
-            # Validate file extension
-            extension = file_path.suffix.lower()
-            supported = state["config"].processing.supported_extensions
-            if extension not in supported:
-                failed_files.append(f"{file.filename} (unsupported format)")
-                continue
-
-            # Save file
-            try:
-                content = await file.read()
-                with open(file_path, 'wb') as f:
-                    f.write(content)
-                uploaded_files.append(str(file_path))
-            except Exception as e:
-                logger.error(f"Failed to save {file.filename}: {e}")
-                failed_files.append(f"{file.filename} ({str(e)})")
+        results = await asyncio.gather(*save_tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"File save error: {result}")
+                failed_files.append(str(result))
+            elif result:
+                uploaded_files.append(result)
 
         if not uploaded_files:
             raise HTTPException(
@@ -149,15 +78,21 @@ async def process_ingestion(
                 detail="No valid files uploaded"
             )
 
-        # Load documents
-        documents = []
+        # Load documents in parallel
+        load_tasks = []
         for file_path in uploaded_files:
-            try:
-                doc = loader.load_document(file_path)
-                documents.append(doc)
-            except Exception as e:
-                logger.error(f"Failed to load {file_path}: {e}")
-                failed_files.append(f"{Path(file_path).name} ({str(e)})")
+            load_tasks.append(
+                run_in_threadpool(loader.load_document, file_path)
+            )
+
+        load_results = await asyncio.gather(*load_tasks, return_exceptions=True)
+        documents = []
+        for result in load_results:
+            if isinstance(result, Exception):
+                logger.error(f"Document load error: {result}")
+                failed_files.append(str(result))
+            else:
+                documents.append(result)
 
         if not documents:
             raise HTTPException(
@@ -174,7 +109,8 @@ async def process_ingestion(
 
         chunks = []
         for doc in documents:
-            doc_chunks = chunking_pipeline.chunk_document(
+            doc_chunks = await run_in_threadpool(
+                chunking_pipeline.chunk_document,
                 doc["content"],
                 doc["metadata"]
             )
@@ -187,11 +123,7 @@ async def process_ingestion(
             )
 
         # Generate embeddings
-        embedding_pipeline = EmbeddingGeneratorPipeline(
-            model=state["config"].embedding.model,
-            batch_size=state["config"].embedding.batch_size,
-            use_cache=state["config"].embedding.cache_enabled
-        )
+        embedding_generator = state["embedding_generator"]
 
         # Prepare chunks for embedding
         chunk_data = [
@@ -199,7 +131,8 @@ async def process_ingestion(
             for chunk in chunks
         ]
 
-        embeddings = embedding_pipeline.generate_embeddings(chunk_data)
+        # Generate embeddings asynchronously
+        embeddings = await embedding_generator.generate_embeddings_async(chunk_data)
 
         # Store in vector store
         vector_store = state["vector_store"]
@@ -209,17 +142,18 @@ async def process_ingestion(
                 detail="Vector store not initialized"
             )
 
-        # Add embeddings
+        # Add embeddings (thread-safe)
         embedding_vectors = [e.embedding for e in embeddings]
         texts = [e.text for e in embeddings]
         metadata_list = [e.metadata for e in embeddings]
         chunk_ids = [f"chunk_{i}" for i in range(len(embeddings))]
 
-        indices = vector_store.add_embeddings(
-            embeddings=embedding_vectors,
-            texts=texts,
-            metadata=metadata_list,
-            chunk_ids=chunk_ids
+        indices = await run_in_threadpool(
+            vector_store.add_embeddings,
+            embedding_vectors,
+            texts,
+            metadata_list,
+            chunk_ids
         )
 
         # Generate document IDs
@@ -233,9 +167,100 @@ async def process_ingestion(
             document_ids=document_ids,
             total_chunks=len(chunks),
             total_documents=len(documents),
-            processing_time_seconds=0,  # Will be updated by caller
+            processing_time_seconds=0,
             failed_files=failed_files
         )
+
+
+async def _save_uploaded_file(file: UploadFile, temp_dir: str) -> Optional[str]:
+    """Save uploaded file asynchronously."""
+    try:
+        file_path = Path(temp_dir) / file.filename
+
+        # Validate file extension
+        extension = file_path.suffix.lower()
+        state = get_app_state()
+        supported = state["config"].processing.supported_extensions
+        if extension not in supported:
+            raise ValueError(f"Unsupported format: {extension}")
+
+        # Check file size
+        max_size = state["config"].processing.max_file_size_mb * 1024 * 1024
+        content = await file.read()
+        if len(content) > max_size:
+            raise ValueError(f"File too large: {len(content)} bytes (max {max_size})")
+
+        # Save file
+        with open(file_path, 'wb') as f:
+            f.write(content)
+
+        return str(file_path)
+
+    except Exception as e:
+        logger.error(f"Failed to save {file.filename}: {e}")
+        return None
+
+
+@async_cached(ttl=300)  # Cache for 5 minutes
+async def _get_cached_query_result(question: str, top_k: int) -> Dict[str, Any]:
+    """Get cached query result."""
+    state = get_app_state()
+
+    # Retrieve documents
+    retrieval_results = state["retriever"].retrieve(question, top_k=top_k)
+
+    if not retrieval_results:
+        return {
+            "answer": "I couldn't find any relevant information in the documents.",
+            "confidence": 0.0,
+            "sources": [],
+            "tokens_used": 0
+        }
+
+    # Prepare context
+    context_chunks = [
+        {"text": r.text, "source": r.metadata.get("file_path", "Unknown")}
+        for r in retrieval_results
+    ]
+
+    # Generate prompt
+    prompt = get_rag_prompt(
+        question=question,
+        chunks=context_chunks
+    )
+
+    # Generate response with LLM
+    llm_response = await run_in_threadpool(
+        state["llm_interface"].generate_simple,
+        prompt,
+        system_prompt="You are a helpful assistant that answers questions based on provided documents."
+    )
+
+    # Post-process response
+    processed_response = await run_in_threadpool(
+        postprocess_response,
+        llm_response,
+        str(context_chunks[:3]),
+        True
+    )
+
+    # Prepare sources
+    sources = []
+    for r in retrieval_results[:5]:
+        source = {
+            "text": r.text[:500] + "..." if len(r.text) > 500 else r.text,
+            "score": r.score,
+            "metadata": r.metadata
+        }
+        sources.append(source)
+
+    return {
+        "answer": processed_response.cleaned_text,
+        "confidence": processed_response.confidence,
+        "sources": sources,
+        "tokens_used": processed_response.tokens_used,
+        "has_hallucination": processed_response.has_hallucination
+    }
 
 
 # ============== API Endpoints ==============
@@ -249,11 +274,11 @@ async def process_ingestion(
 async def query_endpoint(request: QueryRequest):
     """
     Query endpoint for asking questions about documents.
+    Supports caching and async processing.
     """
-    import time
     start_time = time.time()
 
-    state = get_state()
+    state = get_app_state()
 
     # Validate state
     if not state["retriever"] or not state["llm_interface"]:
@@ -269,64 +294,41 @@ async def query_endpoint(request: QueryRequest):
         )
 
     try:
-        # Retrieve relevant documents
-        retrieval_results = state["retriever"].retrieve(
-            query=request.question,
-            top_k=request.top_k
+        # Try to get from cache if not streaming
+        if not request.stream:
+            try:
+                cached_result = await _get_cached_query_result(
+                    request.question,
+                    request.top_k
+                )
+                return QueryResponse(
+                    answer=cached_result["answer"],
+                    confidence=cached_result["confidence"],
+                    sources=cached_result["sources"],
+                    processing_time_ms=(time.time() - start_time) * 1000,
+                    tokens_used=cached_result.get("tokens_used", 0),
+                    has_hallucination=cached_result.get("has_hallucination", False)
+                )
+            except Exception as e:
+                logger.warning(f"Cache lookup failed: {e}")
+                # Fall through to normal processing
+
+        # Normal processing
+        result = await _process_query(
+            request.question,
+            request.top_k,
+            request.temperature,
+            request.max_tokens,
+            request.include_sources
         )
-
-        if not retrieval_results:
-            return QueryResponse(
-                answer="I couldn't find any relevant information in the documents to answer your question.",
-                confidence=0.0,
-                sources=[],
-                processing_time_ms=(time.time() - start_time) * 1000,
-                tokens_used=0
-            )
-
-        # Prepare context
-        context_chunks = [
-            {"text": r.text, "source": r.metadata.get("file_path", "Unknown")}
-            for r in retrieval_results
-        ]
-
-        # Generate prompt
-        prompt = get_rag_prompt(
-            question=request.question,
-            chunks=context_chunks
-        )
-
-        # Generate response with LLM
-        llm_response = state["llm_interface"].generate_simple(
-            prompt=prompt,
-            system_prompt="You are a helpful assistant that answers questions based on provided documents."
-        )
-
-        # Post-process response
-        processed_response = postprocess_response(
-            response=llm_response,
-            context=str(context_chunks[:3]),  # Use first 3 chunks as context
-            aggressive_cleaning=True
-        )
-
-        # Prepare sources
-        sources = []
-        if request.include_sources:
-            for r in retrieval_results[:5]:
-                source = {
-                    "text": r.text[:500] + "..." if len(r.text) > 500 else r.text,
-                    "score": r.score,
-                    "metadata": r.metadata
-                }
-                sources.append(source)
 
         return QueryResponse(
-            answer=processed_response.cleaned_text,
-            confidence=processed_response.confidence,
-            sources=sources,
+            answer=result["answer"],
+            confidence=result["confidence"],
+            sources=result["sources"],
             processing_time_ms=(time.time() - start_time) * 1000,
-            tokens_used=processed_response.tokens_used,
-            has_hallucination=processed_response.has_hallucination
+            tokens_used=result.get("tokens_used", 0),
+            has_hallucination=result.get("has_hallucination", False)
         )
 
     except Exception as e:
@@ -337,24 +339,96 @@ async def query_endpoint(request: QueryRequest):
         )
 
 
+async def _process_query(
+    question: str,
+    top_k: int,
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+    include_sources: bool
+) -> Dict[str, Any]:
+    """Process query asynchronously."""
+    state = get_app_state()
+
+    # Retrieve documents
+    retrieval_results = await run_in_threadpool(
+        state["retriever"].retrieve,
+        question,
+        top_k=top_k
+    )
+
+    if not retrieval_results:
+        return {
+            "answer": "I couldn't find any relevant information in the documents to answer your question.",
+            "confidence": 0.0,
+            "sources": [],
+            "tokens_used": 0,
+            "has_hallucination": False
+        }
+
+    # Prepare context
+    context_chunks = [
+        {"text": r.text, "source": r.metadata.get("file_path", "Unknown")}
+        for r in retrieval_results
+    ]
+
+    # Generate prompt
+    prompt = get_rag_prompt(
+        question=question,
+        chunks=context_chunks
+    )
+
+    # Generate response with LLM
+    llm_response = await run_in_threadpool(
+        state["llm_interface"].generate_simple,
+        prompt,
+        system_prompt="You are a helpful assistant that answers questions based on provided documents."
+    )
+
+    # Post-process response
+    processed_response = await run_in_threadpool(
+        postprocess_response,
+        llm_response,
+        str(context_chunks[:3]),
+        True
+    )
+
+    # Prepare sources
+    sources = []
+    if include_sources:
+        for r in retrieval_results[:5]:
+            source = {
+                "text": r.text[:500] + "..." if len(r.text) > 500 else r.text,
+                "score": r.score,
+                "metadata": r.metadata
+            }
+            sources.append(source)
+
+    return {
+        "answer": processed_response.cleaned_text,
+        "confidence": processed_response.confidence,
+        "sources": sources,
+        "tokens_used": processed_response.tokens_used,
+        "has_hallucination": processed_response.has_hallucination
+    }
+
+
 @router.post(
     "/documents/ingest",
-    response_model=DocumentIngestResponse,
+    response_model=dict,
     summary="Ingest documents",
-    description="Upload documents for ingestion into the system"
+    description="Upload documents for ingestion as a background task"
 )
 async def ingest_documents(
+    background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(..., description="Documents to upload"),
-    chunk_size: int = Form(1000, description="Chunk size in characters", ge=100, le=10000),
-    chunk_overlap: int = Form(200, description="Chunk overlap in characters", ge=0, le=5000),
-    chunking_strategy: str = Form("recursive", description="Chunking strategy")
+    chunk_size: int = Form(800, description="Chunk size in characters", ge=100, le=10000),
+    chunk_overlap: int = Form(150, description="Chunk overlap in characters", ge=0, le=5000),
+    chunking_strategy: str = Form("adaptive", description="Chunking strategy")
 ):
     """
-    Ingest documents into the system.
+    Ingest documents asynchronously using background tasks.
+    Returns a task ID for tracking progress.
     """
-    import time
-    start_time = time.time()
-
     if not files:
         raise HTTPException(
             status_code=400,
@@ -362,13 +436,13 @@ async def ingest_documents(
         )
 
     # Validate file sizes
-    config = get_state()["config"]
+    config = get_app_state()["config"]
     max_size = config.processing.max_file_size_mb * 1024 * 1024
 
     for file in files:
-        file.file.seek(0, 2)
-        size = file.file.tell()
-        file.file.seek(0)
+        await file.seek(0, 2)
+        size = await file.tell()
+        await file.seek(0)
 
         if size > max_size:
             raise HTTPException(
@@ -377,28 +451,95 @@ async def ingest_documents(
             )
 
     try:
-        # Process ingestion
-        result = await process_ingestion(
+        # Create background task
+        task_id = await task_manager.create_task(
+            process_ingestion_task,
             files=files,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             chunking_strategy=chunking_strategy
         )
 
-        # Update processing time
-        result.processing_time_seconds = time.time() - start_time
+        return {
+            "success": True,
+            "task_id": task_id,
+            "message": "Document ingestion started as background task",
+            "status_url": f"/api/v1/tasks/{task_id}"
+        }
 
-        return result
-
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"Ingestion failed: {e}", exc_info=True)
+        logger.error(f"Ingestion task creation failed: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"Ingestion failed: {str(e)}"
+            detail=f"Failed to start ingestion: {str(e)}"
         )
 
+
+@router.get(
+    "/tasks/{task_id}",
+    response_model=TaskStatusResponse,
+    summary="Get task status",
+    description="Get status of a background task"
+)
+async def get_task_status(task_id: str):
+    """
+    Get status of a background task.
+    """
+    status = task_manager.get_task_status(task_id)
+
+    if not status:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Task {task_id} not found"
+        )
+
+    return status
+
+
+@router.get(
+    "/tasks",
+    summary="List tasks",
+    description="List all background tasks"
+)
+async def list_tasks(
+    limit: int = Query(50, description="Maximum number of tasks", ge=1, le=100),
+    status: Optional[str] = Query(None, description="Filter by status")
+):
+    """
+    List background tasks.
+    """
+    tasks = task_manager.list_tasks(limit, status)
+
+    return {
+        "tasks": tasks,
+        "total": len(tasks)
+    }
+
+
+@router.post(
+    "/tasks/{task_id}/cancel",
+    summary="Cancel task",
+    description="Cancel a running background task"
+)
+async def cancel_task(task_id: str):
+    """
+    Cancel a background task.
+    """
+    success = await task_manager.cancel_task(task_id)
+
+    if not success:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Task {task_id} not found or cannot be cancelled"
+        )
+
+    return {
+        "success": True,
+        "message": f"Task {task_id} cancelled"
+    }
+
+
+# ============== Document Management Endpoints ==============
 
 @router.get(
     "/documents",
@@ -413,7 +554,7 @@ async def list_documents(
     """
     List ingested documents.
     """
-    state = get_state()
+    state = get_app_state()
     vector_store = state["vector_store"]
 
     if not vector_store:
@@ -423,7 +564,6 @@ async def list_documents(
         )
 
     # Get all documents from vector store
-    # Note: This is simplified - in production, you'd maintain a separate document index
     documents = []
     seen_docs = set()
 
@@ -463,7 +603,7 @@ async def delete_document(document_id: str):
     """
     Delete a document by ID.
     """
-    state = get_state()
+    state = get_app_state()
     vector_store = state["vector_store"]
 
     if not vector_store:
@@ -480,7 +620,6 @@ async def delete_document(document_id: str):
         if metadata.get("document_id") == document_id:
             indices_to_delete.append(i)
         elif not doc_name and metadata.get("file_path"):
-            # Try to match by filename
             if Path(metadata.get("file_path", "")).stem == document_id:
                 indices_to_delete.append(i)
                 doc_name = metadata.get("file_path")
@@ -491,8 +630,8 @@ async def delete_document(document_id: str):
             detail=f"Document '{document_id}' not found"
         )
 
-    # Delete from vector store
-    vector_store.delete(indices_to_delete)
+    # Delete from vector store (thread-safe)
+    await run_in_threadpool(vector_store.delete, indices_to_delete)
 
     return {
         "success": True,
@@ -510,7 +649,7 @@ async def delete_all_documents():
     """
     Delete all documents.
     """
-    state = get_state()
+    state = get_app_state()
     vector_store = state["vector_store"]
 
     if not vector_store:
@@ -520,7 +659,7 @@ async def delete_all_documents():
         )
 
     count = vector_store.get_size()
-    vector_store.clear()
+    await run_in_threadpool(vector_store.clear)
 
     return {
         "success": True,
@@ -529,156 +668,118 @@ async def delete_all_documents():
     }
 
 
-@router.get(
-    "/documents/stats",
-    summary="Get document statistics",
-    description="Get statistics about ingested documents"
+# ============== Streaming Endpoints ==============
+
+@router.post(
+    "/query/stream",
+    summary="Ask a question with streaming",
+    description="Ask a question and get streaming response"
 )
-async def get_document_stats():
+async def query_stream(request: QueryRequest):
     """
-    Get document statistics.
+    Query with streaming response.
     """
-    state = get_state()
-    vector_store = state["vector_store"]
+    state = get_app_state()
 
-    if not vector_store:
-        return {
-            "total_documents": 0,
-            "total_chunks": 0,
-            "file_types": {},
-            "total_size_bytes": 0
-        }
-
-    stats = {
-        "total_documents": 0,
-        "total_chunks": vector_store.get_size(),
-        "file_types": {},
-        "total_size_bytes": 0,
-        "documents": []
-    }
-
-    seen_docs = set()
-    for metadata in vector_store.metadata:
-        doc_name = metadata.get("file_path", metadata.get("file_name", ""))
-        file_type = metadata.get("file_type", "unknown")
-
-        if doc_name not in seen_docs:
-            seen_docs.add(doc_name)
-            stats["total_documents"] += 1
-            stats["file_types"][file_type] = stats["file_types"].get(file_type, 0) + 1
-            stats["total_size_bytes"] += metadata.get("file_size", 0)
-
-    return stats
-
-
-@router.get(
-    "/health",
-    summary="Health check",
-    description="Check system health status"
-)
-async def health_check():
-    """
-    Health check endpoint.
-    """
-    state = get_state()
-
-    vector_store_ready = state["vector_store"] is not None
-    retriever_ready = state["retriever"] is not None
-    llm_ready = state["llm_interface"] is not None
-
-    status = "healthy"
-    issues = []
-
-    if not vector_store_ready:
-        issues.append("Vector store not initialized")
-        status = "degraded"
-
-    if not retriever_ready:
-        issues.append("Retriever not initialized")
-        status = "degraded"
-
-    if not llm_ready:
-        issues.append("LLM interface not initialized")
-        status = "degraded"
-
-    return {
-        "status": status,
-        "version": "1.0.0",
-        "timestamp": datetime.now().isoformat(),
-        "components": {
-            "vector_store": "ready" if vector_store_ready else "unavailable",
-            "retriever": "ready" if retriever_ready else "unavailable",
-            "llm_interface": "ready" if llm_ready else "unavailable"
-        },
-        "issues": issues,
-        "vector_store_size": state["vector_store"].get_size() if vector_store_ready else 0,
-        "uptime_seconds": (
-            (datetime.now() - state["startup_time"]).total_seconds()
-            if state["startup_time"] else 0
+    if not state["retriever"] or not state["llm_interface"]:
+        raise HTTPException(
+            status_code=503,
+            detail="System not fully initialized"
         )
-    }
+
+    if state["vector_store"].get_size() == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No documents ingested"
+        )
+
+    async def generate_stream():
+        try:
+            # Retrieve documents
+            retrieval_results = await run_in_threadpool(
+                state["retriever"].retrieve,
+                request.question,
+                top_k=request.top_k
+            )
+
+            if not retrieval_results:
+                yield json.dumps({"type": "error", "message": "No relevant documents found"}) + "\n"
+                return
+
+            # Prepare context
+            context_chunks = [
+                {"text": r.text, "source": r.metadata.get("file_path", "Unknown")}
+                for r in retrieval_results
+            ]
+
+            # Generate prompt
+            prompt = get_rag_prompt(
+                question=request.question,
+                chunks=context_chunks
+            )
+
+            # Stream response
+            llm_response = await run_in_threadpool(
+                state["llm_interface"].generate,
+                [{"role": "user", "content": prompt}],
+                stream=True
+            )
+
+            full_response = ""
+            for chunk in llm_response:
+                if chunk.content:
+                    full_response += chunk.content
+                    yield json.dumps({
+                        "type": "chunk",
+                        "content": chunk.content
+                    }) + "\n"
+
+            # Post-process and send final answer
+            processed = await run_in_threadpool(
+                postprocess_response,
+                full_response,
+                str(context_chunks[:3]),
+                True
+            )
+
+            # Send sources
+            sources = []
+            for r in retrieval_results[:5]:
+                sources.append({
+                    "text": r.text[:500] + "..." if len(r.text) > 500 else r.text,
+                    "score": r.score,
+                    "metadata": r.metadata
+                })
+
+            yield json.dumps({
+                "type": "final",
+                "answer": processed.cleaned_text,
+                "confidence": processed.confidence,
+                "sources": sources,
+                "has_hallucination": processed.has_hallucination
+            }) + "\n"
+
+        except Exception as e:
+            yield json.dumps({"type": "error", "message": str(e)}) + "\n"
+
+    return StreamingResponse(
+        generate_stream(),
+        media_type="application/x-ndjson"
+    )
 
 
-@router.get(
-    "/metrics",
-    summary="Get metrics",
-    description="Get system metrics and performance data"
-)
-async def get_metrics():
-    """
-    Get system metrics.
-    """
-    state = get_state()
-    vector_store = state["vector_store"]
-
-    metrics = {
-        "system": {
-            "uptime_seconds": (
-                (datetime.now() - state["startup_time"]).total_seconds()
-                if state["startup_time"] else 0
-            ),
-            "request_count": state["request_count"],
-            "active_connections": state["active_connections"]
-        },
-        "vector_store": {
-            "size": vector_store.get_size() if vector_store else 0,
-            "dimension": state["config"].vector_store.dimension if state["config"] else 0,
-            "index_type": state["config"].vector_store.index_type if state["config"] else "unknown"
-        },
-        "config": {
-            "model": state["config"].llm.model if state["config"] else "unknown",
-            "embedding_model": state["config"].embedding.model if state["config"] else "unknown",
-            "chunk_size": state["config"].processing.chunk_size if state["config"] else 0,
-            "top_k": state["config"].retrieval.top_k if state["config"] else 0
-        }
-    }
-
-    # Add memory usage if available
-    try:
-        import psutil
-        process = psutil.Process()
-        memory = process.memory_info()
-        metrics["memory"] = {
-            "rss_mb": memory.rss / 1024 / 1024,
-            "vms_mb": memory.vms / 1024 / 1024,
-            "percent": process.memory_percent()
-        }
-    except ImportError:
-        pass
-
-    return metrics
-
+# ============== Configuration Endpoint ==============
 
 @router.get(
     "/config",
     summary="Get configuration",
     description="Get current system configuration (sensitive info redacted)"
 )
-async def get_config():
+async def get_config_endpoint():
     """
     Get system configuration.
     """
-    state = get_state()
+    state = get_app_state()
     config = state["config"]
 
     if not config:

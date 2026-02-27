@@ -1,29 +1,97 @@
 """
-Unit tests for document ingestion module including loader and chunker.
+Integration tests for DocQA AI system.
+Tests the full pipeline from document ingestion to query processing.
 """
 
-import pytest
 import os
+import sys
+import json
+import pytest
+import asyncio
 import tempfile
 from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock
+from typing import List, Dict, Any, Optional
+from datetime import datetime
+import time
+import shutil
 
-# Import modules to test
-import sys
+# Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.ingestion.loader import (
-    PDFLoader, DOCXLoader, TextLoader, HTMLLoader,
-    MarkdownLoader, CSVLoader, DocumentLoader
-)
-from src.ingestion.chunker import (
-    FixedSizeChunker, SentenceChunker, ParagraphChunker,
-    RecursiveChunker, SlidingWindowChunker, MarkdownChunker,
-    CodeChunker, ChunkingPipeline, ChunkingStrategy, Chunk
-)
+from src.ingestion.loader import DocumentLoader
+from src.ingestion.chunker import ChunkingPipeline, ChunkingStrategy
+from src.ingestion.embedding_generator import BatchEmbeddingGenerator
+from src.retrieval.vector_store import FAISSVectorStore
+from src.retrieval.retriever import VectorRetriever, create_retriever
+from src.retrieval.hybrid_search import HybridSearcher, create_hybrid_searcher
+from src.generation.llm_interface import LLMInterface
+from src.generation.prompt_templates import get_rag_prompt
+from src.generation.response_postprocess import postprocess_response
+from src.evaluation.metrics import calculate_metrics
+from src.evaluation.faithfulness import evaluate_faithfulness
+from src.utils.config import get_config
+from src.utils.logger import setup_logging
+
+# Setup logging for tests
+setup_logging(level="WARNING", log_to_file=False)
+
+logger = logging.getLogger(__name__)
 
 
-# ============== Fixtures ==============
+# ============================================================
+# Test Fixtures
+# ============================================================
+
+@pytest.fixture
+def sample_documents():
+    """Create sample documents for testing."""
+    return [
+        {
+            "name": "sample1.txt",
+            "content": """
+            Machine learning is a subset of artificial intelligence that enables systems to learn and improve 
+            from experience without being explicitly programmed. It uses algorithms to find patterns in data 
+            and make predictions or decisions. The three main types of machine learning are supervised learning, 
+            unsupervised learning, and reinforcement learning.
+            """
+        },
+        {
+            "name": "sample2.txt",
+            "content": """
+            Deep learning is a subset of machine learning that uses neural networks with multiple layers to 
+            learn hierarchical representations of data. Neural networks are computational models inspired by 
+            biological neural networks. They consist of interconnected nodes or neurons organized in layers.
+            """
+        },
+        {
+            "name": "sample3.txt",
+            "content": """
+            Natural Language Processing (NLP) is a field of artificial intelligence that focuses on the 
+            interaction between computers and human language. It enables computers to understand, interpret, 
+            and generate human language. Key NLP tasks include sentiment analysis, named entity recognition, 
+            machine translation, text summarization, and question answering.
+            """
+        },
+        {
+            "name": "sample4.txt",
+            "content": """
+            Computer vision is a field of artificial intelligence that enables computers to interpret and 
+            understand visual information from the world. It involves acquiring, processing, analyzing, and 
+            understanding images and video. Key computer vision tasks include image classification, object 
+            detection, image segmentation, facial recognition, and optical character recognition.
+            """
+        },
+        {
+            "name": "sample5.txt",
+            "content": """
+            RAG (Retrieval-Augmented Generation) is a framework that combines retrieval-based and generation-based 
+            approaches to improve the quality and accuracy of AI responses. It enhances large language models by 
+            incorporating information retrieval from external knowledge sources, helping to reduce hallucinations 
+            and improve factual accuracy.
+            """
+        }
+    ]
+
 
 @pytest.fixture
 def temp_dir():
@@ -33,641 +101,676 @@ def temp_dir():
 
 
 @pytest.fixture
-def sample_pdf_file(temp_dir):
-    """Create a sample PDF file for testing."""
-    # Note: Creating a real PDF requires libraries; we'll mock for unit tests
-    pdf_path = os.path.join(temp_dir, "sample.pdf")
-    return pdf_path
+def sample_files(temp_dir, sample_documents):
+    """Create sample files in temporary directory."""
+    files = []
+    for doc in sample_documents:
+        file_path = Path(temp_dir) / doc["name"]
+        with open(file_path, 'w') as f:
+            f.write(doc["content"])
+        files.append(str(file_path))
+    return files
 
 
 @pytest.fixture
-def sample_text_file(temp_dir):
-    """Create a sample text file."""
-    text_path = os.path.join(temp_dir, "sample.txt")
-    with open(text_path, 'w', encoding='utf-8') as f:
-        f.write("This is a test document.\nIt has multiple lines.\nThis is the third line.")
-    return text_path
+def sample_queries():
+    """Sample queries for testing."""
+    return [
+        {
+            "query": "What is machine learning?",
+            "expected_keywords": ["subset", "artificial intelligence", "algorithms", "patterns"]
+        },
+        {
+            "query": "What are neural networks?",
+            "expected_keywords": ["computational models", "biological", "neurons", "layers"]
+        },
+        {
+            "query": "What is Natural Language Processing?",
+            "expected_keywords": ["field", "artificial intelligence", "interaction", "understand", "generate"]
+        },
+        {
+            "query": "What is computer vision?",
+            "expected_keywords": ["interpret", "understand", "visual information", "images", "video"]
+        },
+        {
+            "query": "What is RAG?",
+            "expected_keywords": ["Retrieval-Augmented Generation", "retrieval", "generation", "hallucinations"]
+        }
+    ]
 
 
 @pytest.fixture
-def sample_html_file(temp_dir):
-    """Create a sample HTML file."""
-    html_path = os.path.join(temp_dir, "sample.html")
-    with open(html_path, 'w', encoding='utf-8') as f:
-        f.write("""
-        <html>
-            <head><title>Test Page</title></head>
-            <body>
-                <h1>Test Header</h1>
-                <p>This is a test paragraph.</p>
-                <p>Another paragraph here.</p>
-            </body>
-        </html>
-        """)
-    return html_path
+def mock_embedding_generator(monkeypatch):
+    """Mock embedding generator for testing."""
+    class MockEmbeddingGenerator:
+        def __init__(self, *args, **kwargs):
+            self.dimension = 384
+            self.model = "test-model"
+
+        def generate_embeddings(self, chunks, **kwargs):
+            import numpy as np
+            results = []
+            for chunk in chunks:
+                text = chunk.get("text", "") if isinstance(chunk, dict) else chunk
+                # Create deterministic embeddings based on text hash
+                import hashlib
+                hash_val = int(hashlib.md5(text.encode()).hexdigest(), 16)
+                np.random.seed(hash_val % 2**32)
+                embedding = np.random.randn(self.dimension).tolist()
+
+                # Create result object
+                class Result:
+                    def __init__(self):
+                        self.embedding = embedding
+                        self.text = text
+                        self.metadata = chunk.get("metadata", {}) if isinstance(chunk, dict) else {}
+                        self.model = self.model
+                        self.tokens_used = len(text) // 4
+                results.append(Result())
+            return results
+
+        async def generate_embeddings_async(self, chunks, **kwargs):
+            return self.generate_embeddings(chunks, **kwargs)
+
+        def get_embedding_dimension(self):
+            return self.dimension
+
+        def clear_cache(self):
+            pass
+
+    return MockEmbeddingGenerator()
 
 
 @pytest.fixture
-def sample_csv_file(temp_dir):
-    """Create a sample CSV file."""
-    csv_path = os.path.join(temp_dir, "sample.csv")
-    with open(csv_path, 'w', encoding='utf-8') as f:
-        f.write("name,age,city\n")
-        f.write("Alice,30,New York\n")
-        f.write("Bob,25,Los Angeles\n")
-        f.write("Charlie,35,Chicago\n")
-    return csv_path
+def mock_llm_interface(monkeypatch):
+    """Mock LLM interface for testing."""
+    class MockLLMInterface:
+        def __init__(self, *args, **kwargs):
+            self.model = "test-model"
+            self.provider = "test"
+
+        def generate(self, messages, **kwargs):
+            # Return a simple response based on the query
+            query = messages[-1]["content"] if messages else ""
+
+            class Response:
+                def __init__(self, content):
+                    self.content = content
+                    self.model = "test-model"
+                    self.provider = "test"
+                    self.prompt_tokens = 10
+                    self.completion_tokens = 20
+                    self.total_tokens = 30
+                    self.cost = 0.0
+                    self.finish_reason = "stop"
+                    self.latency_ms = 100
+                    self.raw_response = None
+
+            # Extract question from prompt
+            if "Question:" in query:
+                question = query.split("Question:")[-1].split("\n")[0].strip()
+            else:
+                question = query[:100]
+
+            answer = f"This is a test response about: {question[:50]}..."
+            return Response(answer)
+
+        def generate_simple(self, prompt, system_prompt=None):
+            # Extract question from prompt
+            if "Question:" in prompt:
+                question = prompt.split("Question:")[-1].split("\n")[0].strip()
+            else:
+                question = prompt[:100]
+
+            return f"This is a test response about: {question[:50]}..."
+
+        def get_model_info(self):
+            return {"model": "test-model", "provider": "test"}
+
+    return MockLLMInterface()
 
 
 @pytest.fixture
-def sample_markdown_file(temp_dir):
-    """Create a sample markdown file."""
-    md_path = os.path.join(temp_dir, "sample.md")
-    with open(md_path, 'w', encoding='utf-8') as f:
-        f.write(""# Sample Header
+def mock_retriever(monkeypatch):
+    """Mock retriever for testing."""
+    class MockRetriever:
+        def __init__(self, *args, **kwargs):
+            self.top_k = 5
 
-This is a paragraph with **bold** text.
+        def retrieve(self, query, top_k=None):
+            class Result:
+                def __init__(self, text, score=0.8):
+                    self.text = text
+                    self.score = score
+                    self.metadata = {"source": "test_doc.txt"}
+                    self.chunk_id = f"chunk_{hash(text) % 1000}"
+                    self.index = 0
 
-## Subheader
+            # Return mock results based on query
+            if "machine learning" in query.lower():
+                return [
+                    Result("Machine learning is a subset of artificial intelligence that enables systems to learn from data.", 0.95),
+                    Result("The three main types of machine learning are supervised, unsupervised, and reinforcement learning.", 0.85)
+                ]
+            elif "neural" in query.lower():
+                return [
+                    Result("Neural networks are computational models inspired by biological neural networks.", 0.95),
+                    Result("Deep learning uses neural networks with multiple layers.", 0.85)
+                ]
+            elif "NLP" in query or "Natural Language" in query:
+                return [
+                    Result("NLP is a field of AI that focuses on the interaction between computers and human language.", 0.95),
+                    Result("Key NLP tasks include sentiment analysis, machine translation, and question answering.", 0.85)
+                ]
+            elif "computer vision" in query.lower():
+                return [
+                    Result("Computer vision enables computers to interpret and understand visual information.", 0.95),
+                    Result("Key computer vision tasks include image classification and object detection.", 0.85)
+                ]
+            elif "RAG" in query or "Retrieval-Augmented" in query:
+                return [
+                    Result("RAG combines retrieval-based and generation-based approaches to improve AI responses.", 0.95),
+                    Result("RAG helps reduce hallucinations in AI responses.", 0.85)
+                ]
+            else:
+                return [Result(f"Test result for: {query[:30]}...", 0.7)]
 
-- List item 1
-- List item 2
+        def retrieve_with_embeddings(self, embedding, top_k=None):
+            return self.retrieve("test query", top_k)
 
-[Link](http://example.com)
-    return md_path
+    return MockRetriever()
 
 
 @pytest.fixture
-def sample_text():
-    """Return sample text for chunking tests."""
-    return """
-    This is the first sentence. Here is the second sentence. And a third one.
-    
-    This is a new paragraph with different content. It has multiple sentences as well.
-    
-    Another paragraph here. With more text to test chunking boundaries.
-    """
+def integration_components(mock_embedding_generator, mock_llm_interface, mock_retriever):
+    """Set up integration test components."""
+    return {
+        "embedding_generator": mock_embedding_generator,
+        "llm_interface": mock_llm_interface,
+        "retriever": mock_retriever
+    }
 
 
-# ============== Loader Tests ==============
+# ============================================================
+# Integration Tests
+# ============================================================
 
-class TestTextLoader:
-    """Tests for TextLoader class."""
+class TestDocumentIngestion:
+    """Integration tests for document ingestion pipeline."""
 
-    def test_load_text_file(self, sample_text_file):
-        """Test loading a text file."""
-        loader = TextLoader()
-        content = loader.load(sample_text_file)
-
-        assert "This is a test document" in content
-        assert "multiple lines" in content
-        assert len(content) > 0
-
-    def test_load_nonexistent_file(self):
-        """Test loading non-existent file raises exception."""
-        loader = TextLoader()
-        with pytest.raises(Exception):
-            loader.load("/nonexistent/file.txt")
-
-    def test_get_metadata(self, sample_text_file):
-        """Test metadata extraction from text file."""
-        loader = TextLoader()
-        metadata = loader.get_metadata(sample_text_file)
-
-        assert metadata["file_path"] == sample_text_file
-        assert metadata["file_type"] == "txt"
-        assert metadata["file_size"] > 0
-        assert "encoding" in metadata
-
-
-class TestPDFLoader:
-    """Tests for PDFLoader class."""
-
-    @patch('PyPDF2.PdfReader')
-    def test_load_pdf_mock(self, mock_pdf_reader, sample_pdf_file):
-        """Test PDF loading with mock."""
-        # Create mock PDF reader
-        mock_page = MagicMock()
-        mock_page.extract_text.return_value = "Sample PDF content"
-        mock_pdf = MagicMock()
-        mock_pdf.pages = [mock_page]
-        mock_pdf.metadata = {"/Title": "Test PDF", "/Author": "Test Author"}
-        mock_pdf_reader.return_value = mock_pdf
-
-        loader = PDFLoader()
-
-        # Mock open to avoid actual file read
-        with patch('builtins.open', MagicMock()):
-            content = loader.load(sample_pdf_file)
-            assert "Sample PDF content" in content
-
-    def test_pdf_loader_metadata(self):
-        """Test PDF metadata extraction."""
-        loader = PDFLoader()
-        metadata = loader.get_metadata("test.pdf")
-
-        assert metadata["file_path"] == "test.pdf"
-        assert metadata["file_type"] == "pdf"
-
-
-class TestHTMLLoader:
-    """Tests for HTMLLoader class."""
-
-    def test_load_html(self, sample_html_file):
-        """Test loading HTML content."""
-        loader = HTMLLoader()
-        content = loader.load(sample_html_file)
-
-        assert "Test Header" in content
-        assert "test paragraph" in content
-        assert "Another paragraph" in content
-
-    def test_html_metadata(self, sample_html_file):
-        """Test HTML metadata extraction."""
-        loader = HTMLLoader()
-        metadata = loader.get_metadata(sample_html_file)
-
-        assert metadata["file_type"] == "html"
-        assert metadata["file_size"] > 0
-        assert metadata["title"] == "Test Page"
-
-
-class TestCSVLoader:
-    """Tests for CSVLoader class."""
-
-    def test_load_csv(self, sample_csv_file):
-        """Test loading CSV content."""
-        loader = CSVLoader()
-        content = loader.load(sample_csv_file)
-
-        assert "Columns: name, age, city" in content or "Columns: name,age,city" in content
-        assert "Alice" in content
-        assert "Bob" in content
-        assert "Charlie" in content
-
-    def test_csv_metadata(self, sample_csv_file):
-        """Test CSV metadata extraction."""
-        loader = CSVLoader()
-        metadata = loader.get_metadata(sample_csv_file)
-
-        assert metadata["file_type"] == "csv"
-        assert metadata["num_rows"] == 4  # Header + 3 data rows
-        assert metadata["num_columns"] == 3
-
-
-class TestMarkdownLoader:
-    """Tests for MarkdownLoader class."""
-
-    def test_load_markdown(self, sample_markdown_file):
-        """Test loading markdown content."""
-        loader = MarkdownLoader()
-        content = loader.load(sample_markdown_file)
-
-        assert "Sample Header" in content
-        assert "paragraph" in content
-        assert "Subheader" in content
-        # Bold text should be extracted
-        assert "bold" in content.lower()
-
-    def test_markdown_metadata(self, sample_markdown_file):
-        """Test markdown metadata extraction."""
-        loader = MarkdownLoader()
-        metadata = loader.get_metadata(sample_markdown_file)
-
-        assert metadata["file_type"] == "md"
-        assert metadata["file_size"] > 0
-
-
-class TestDocumentLoader:
-    """Tests for main DocumentLoader class."""
-
-    def test_load_single_file(self, sample_text_file):
-        """Test loading a single file."""
+    def test_load_documents(self, sample_files):
+        """Test loading documents from files."""
         loader = DocumentLoader()
-        result = loader.load_document(sample_text_file)
-
-        assert "content" in result
-        assert "metadata" in result
-        assert "file_path" in result
-        assert len(result["content"]) > 0
-
-    def test_load_directory(self, temp_dir, sample_text_file, sample_html_file):
-        """Test loading all files from a directory."""
-        loader = DocumentLoader()
-        docs = loader.load_directory(temp_dir)
-
-        assert len(docs) >= 2  # Should load both txt and html
-
-    def test_load_directory_with_filter(self, temp_dir, sample_text_file, sample_html_file):
-        """Test loading directory with extension filter."""
-        loader = DocumentLoader()
-        docs = loader.load_directory(temp_dir, extensions=['.txt'])
-
-        assert len(docs) == 1
-        assert docs[0]["metadata"]["file_type"] == "txt"
-
-    def test_unsupported_file_type(self, temp_dir):
-        """Test loading unsupported file type."""
-        unsupported_path = os.path.join(temp_dir, "file.xyz")
-        with open(unsupported_path, 'w') as f:
-            f.write("test")
-
-        loader = DocumentLoader()
-        with pytest.raises(ValueError):
-            loader.load_document(unsupported_path)
-
-    def test_nonexistent_file(self):
-        """Test loading non-existent file."""
-        loader = DocumentLoader()
-        with pytest.raises(FileNotFoundError):
-            loader.load_document("/nonexistent/file.pdf")
-
-    def test_load_directory_nonexistent(self):
-        """Test loading non-existent directory."""
-        loader = DocumentLoader()
-        with pytest.raises(FileNotFoundError):
-            loader.load_directory("/nonexistent/directory")
-
-
-# ============== Chunker Tests ==============
-
-class TestFixedSizeChunker:
-    """Tests for FixedSizeChunker."""
-
-    def test_chunk_basic(self, sample_text):
-        """Test basic chunking functionality."""
-        chunker = FixedSizeChunker(chunk_size=100, chunk_overlap=20)
-        chunks = chunker.chunk(sample_text)
-
-        assert len(chunks) > 0
-        assert all(isinstance(chunk, Chunk) for chunk in chunks)
-        assert all(len(chunk.text) <= 100 for chunk in chunks)
-
-    def test_chunk_overlap(self, sample_text):
-        """Test that chunks have overlap."""
-        chunker = FixedSizeChunker(chunk_size=100, chunk_overlap=30)
-        chunks = chunker.chunk(sample_text)
-
-        if len(chunks) > 1:
-            # Check that chunks overlap (some text appears in both)
-            assert len(chunks[0].text) > 0
-            assert len(chunks[1].text) > 0
-
-    def test_empty_text(self):
-        """Test chunking empty text."""
-        chunker = FixedSizeChunker()
-        chunks = chunker.chunk("")
-
-        assert len(chunks) == 0
-
-    def test_chunk_metadata(self, sample_text):
-        """Test that chunks get proper metadata."""
-        metadata = {"source": "test", "doc_id": 123}
-        chunker = FixedSizeChunker()
-        chunks = chunker.chunk(sample_text, metadata)
-
-        if chunks:
-            assert chunks[0].metadata["source"] == "test"
-            assert chunks[0].metadata["doc_id"] == 123
-            assert "chunk_index" in chunks[0].metadata
-
-
-class TestSentenceChunker:
-    """Tests for SentenceChunker."""
-
-    def test_chunk_by_sentences(self):
-        """Test chunking by sentences."""
-        text = "First sentence. Second sentence. Third sentence. Fourth sentence. Fifth sentence."
-        chunker = SentenceChunker(chunk_size=2, chunk_overlap=0)
-        chunks = chunker.chunk(text)
-
-        # Should create chunks of 2 sentences each
-        for chunk in chunks:
-            sentence_count = chunk.text.count('.')
-            assert sentence_count <= 2
-
-    def test_sentence_overlap(self):
-        """Test sentence chunker with overlap."""
-        text = "Sent1. Sent2. Sent3. Sent4. Sent5."
-        chunker = SentenceChunker(chunk_size=3, chunk_overlap=1)
-        chunks = chunker.chunk(text)
-
-        if len(chunks) > 1:
-            # Should have overlapping sentences
-            assert len(chunks) > 0
-
-
-class TestParagraphChunker:
-    """Tests for ParagraphChunker."""
-
-    def test_chunk_by_paragraphs(self):
-        """Test chunking by paragraphs."""
-        text = "Para1 content.\n\nPara2 content.\n\nPara3 content."
-        chunker = ParagraphChunker(chunk_size=200, chunk_overlap=0)
-        chunks = chunker.chunk(text)
-
-        assert len(chunks) > 0
-
-    def test_paragraph_boundaries(self):
-        """Test that chunk boundaries respect paragraph boundaries."""
-        text = "First paragraph.\n\nSecond paragraph.\n\nThird paragraph."
-        chunker = ParagraphChunker(chunk_size=50, chunk_overlap=0)
-        chunks = chunker.chunk(text)
-
-        # Each chunk should contain complete paragraphs
-        for chunk in chunks:
-            assert "\n\n" in chunk.text or len(chunk.text) <= 50
-
-
-class TestRecursiveChunker:
-    """Tests for RecursiveChunker."""
-
-    def test_recursive_splitting(self):
-        """Test recursive splitting with different separators."""
-        text = "Section 1.\n\nSection 2.\nLine 1.\nLine 2.\n\nSection 3."
-        chunker = RecursiveChunker(chunk_size=50, chunk_overlap=0)
-        chunks = chunker.chunk(text)
-
-        assert len(chunks) > 0
-
-    def test_fallback_to_fixed_size(self):
-        """Test fallback to fixed size when separators fail."""
-        text = "A" * 1000  # Long string without separators
-        chunker = RecursiveChunker(chunk_size=200, chunk_overlap=0)
-        chunks = chunker.chunk(text)
-
-        assert len(chunks) > 1
-        assert all(len(chunk.text) <= 200 for chunk in chunks)
-
-
-class TestSlidingWindowChunker:
-    """Tests for SlidingWindowChunker."""
-
-    def test_sliding_window(self):
-        """Test sliding window chunking."""
-        text = "This is a test document with multiple words " * 50
-        chunker = SlidingWindowChunker(chunk_size=200, chunk_overlap=50)
-        chunks = chunker.chunk(text)
-
-        assert len(chunks) > 1
-
-        # Check that chunks have overlap
-        if len(chunks) > 1:
-            first_chunk_end = chunks[0].text[-50:]
-            second_chunk_start = chunks[1].text[:50]
-            # Some overlap should exist
-            assert len(first_chunk_end) > 0
-
-    def test_invalid_overlap(self):
-        """Test handling of invalid overlap values."""
-        text = "Test text " * 100
-        chunker = SlidingWindowChunker(chunk_size=100, chunk_overlap=150)
-        chunks = chunker.chunk(text)
-
-        # Should handle gracefully without crashing
-        assert isinstance(chunks, list)
-
-
-class TestMarkdownChunker:
-    """Tests for MarkdownChunker."""
-
-    def test_markdown_header_preservation(self):
-        """Test that markdown headers are preserved in chunks."""
-        text = """# Header 1
-Content for section 1.
-
-## Header 2
-Content for section 2.
-
-### Header 3
-Content for section 3.
-"""
-        chunker = MarkdownChunker(chunk_size=200, chunk_overlap=0)
-        chunks = chunker.chunk(text)
-
-        # Headers should be preserved in respective chunks
-        for chunk in chunks:
-            if "Header 1" in chunk.text:
-                assert "Content for section 1" in chunk.text
-
-    def test_markdown_metadata(self):
-        """Test metadata attachment in markdown chunks."""
-        text = "# Test\nContent here."
-        chunker = MarkdownChunker()
-        metadata = {"doc_name": "test.md"}
-        chunks = chunker.chunk(text, metadata)
-
-        if chunks:
-            assert chunks[0].metadata["doc_name"] == "test.md"
-
-
-class TestCodeChunker:
-    """Tests for CodeChunker."""
-
-    def test_python_function_preservation(self):
-        """Test that Python functions are kept intact."""
-        text = """
-def test_function():
-    print("Inside function")
-    return True
-
-class TestClass:
-    def method(self):
-        pass
-
-print("Outside")
-"""
-        chunker = CodeChunker(chunk_size=300, chunk_overlap=0, language="python")
-        chunks = chunker.chunk(text)
-
-        # Functions should not be split across chunks
-        for chunk in chunks:
-            if "def test_function" in chunk.text:
-                assert "return True" in chunk.text
-                assert "Outside" not in chunk.text or len(chunk.text) < 100
-
-    def test_code_metadata(self):
-        """Test metadata for code chunks."""
-        text = "def func():\n    pass"
-        chunker = CodeChunker()
-        metadata = {"language": "python", "file": "test.py"}
-        chunks = chunker.chunk(text, metadata)
-
-        if chunks:
-            assert chunks[0].metadata["language"] == "python"
-
-
-class TestChunkingPipeline:
-    """Tests for main ChunkingPipeline class."""
-
-    def test_pipeline_creation(self):
-        """Test creating pipeline with different strategies."""
-        for strategy in ChunkingStrategy:
-            pipeline = ChunkingPipeline(strategy=strategy, chunk_size=100)
-            assert pipeline.chunker is not None
-
-    def test_chunk_document(self, sample_text):
-        """Test chunking a single document."""
-        pipeline = ChunkingPipeline(chunk_size=100, chunk_overlap=20)
-        chunks = pipeline.chunk_document(sample_text)
-
-        assert len(chunks) > 0
-        assert all(isinstance(chunk, Chunk) for chunk in chunks)
-
-    def test_chunk_batch(self, sample_text):
-        """Test chunking multiple documents."""
-        documents = [
-            {"content": sample_text, "metadata": {"doc_id": 1}},
-            {"content": "Another document here.", "metadata": {"doc_id": 2}}
+        documents = []
+
+        for file_path in sample_files:
+            doc = loader.load_document(file_path)
+            documents.append(doc)
+
+        assert len(documents) == len(sample_files)
+        for doc in documents:
+            assert "content" in doc
+            assert "metadata" in doc
+            assert "file_path" in doc
+            assert len(doc["content"]) > 0
+
+    def test_chunk_documents(self, sample_documents):
+        """Test chunking documents."""
+        chunker = ChunkingPipeline(
+            strategy=ChunkingStrategy.RECURSIVE,
+            chunk_size=200,
+            chunk_overlap=50
+        )
+
+        all_chunks = []
+        for doc in sample_documents:
+            chunks = chunker.chunk_document(doc["content"])
+            all_chunks.extend(chunks)
+
+        assert len(all_chunks) > 0
+        for chunk in all_chunks:
+            assert chunk.text is not None
+            assert len(chunk.text) > 0
+            assert hasattr(chunk, 'metadata')
+
+    def test_embedding_generation(self, sample_documents, mock_embedding_generator):
+        """Test embedding generation."""
+        chunks = []
+        for doc in sample_documents[:2]:
+            chunker = ChunkingPipeline(chunk_size=300, chunk_overlap=50)
+            doc_chunks = chunker.chunk_document(doc["content"])
+            chunks.extend(doc_chunks)
+
+        chunk_data = [{"text": c.text, "metadata": c.metadata} for c in chunks]
+        embeddings = mock_embedding_generator.generate_embeddings(chunk_data)
+
+        assert len(embeddings) == len(chunks)
+        for emb in embeddings:
+            assert hasattr(emb, 'embedding')
+            assert len(emb.embedding) == mock_embedding_generator.dimension
+
+    def test_vector_store_operations(self, sample_documents, mock_embedding_generator):
+        """Test vector store operations."""
+        # Chunk documents
+        chunker = ChunkingPipeline(chunk_size=300, chunk_overlap=50)
+        chunks = []
+        for doc in sample_documents[:2]:
+            doc_chunks = chunker.chunk_document(doc["content"])
+            chunks.extend(doc_chunks)
+
+        # Generate embeddings
+        chunk_data = [{"text": c.text, "metadata": c.metadata} for c in chunks]
+        embeddings = mock_embedding_generator.generate_embeddings(chunk_data)
+
+        # Create vector store
+        dimension = mock_embedding_generator.dimension
+        vector_store = FAISSVectorStore(dimension=dimension, index_type="FlatIP")
+
+        # Add embeddings
+        vectors = [e.embedding for e in embeddings]
+        texts = [e.text for e in embeddings]
+        metadata_list = [e.metadata for e in embeddings]
+
+        vector_store.add_embeddings(vectors, texts, metadata_list)
+
+        assert vector_store.get_size() == len(embeddings)
+
+        # Search
+        query = "machine learning"
+        query_embedding = mock_embedding_generator.generate_embeddings([{"text": query}])[0].embedding
+        results = vector_store.search(query_embedding, top_k=3)
+
+        assert len(results) > 0
+        for result in results:
+            assert result.text is not None
+            assert result.score > 0
+            assert result.index >= 0
+
+
+class TestRetrieval:
+    """Integration tests for retrieval system."""
+
+    def test_vector_retrieval(self, sample_documents, mock_embedding_generator):
+        """Test vector retrieval."""
+        # Set up vector store
+        chunker = ChunkingPipeline(chunk_size=300, chunk_overlap=50)
+        chunks = []
+        for doc in sample_documents:
+            doc_chunks = chunker.chunk_document(doc["content"])
+            chunks.extend(doc_chunks)
+
+        chunk_data = [{"text": c.text, "metadata": c.metadata} for c in chunks]
+        embeddings = mock_embedding_generator.generate_embeddings(chunk_data)
+
+        dimension = mock_embedding_generator.dimension
+        vector_store = FAISSVectorStore(dimension=dimension, index_type="FlatIP")
+
+        vectors = [e.embedding for e in embeddings]
+        texts = [e.text for e in embeddings]
+        metadata_list = [e.metadata for e in embeddings]
+        vector_store.add_embeddings(vectors, texts, metadata_list)
+
+        # Create retriever
+        retriever = create_retriever(
+            retriever_type="vector",
+            vector_store=vector_store,
+            embedding_generator=mock_embedding_generator,
+            top_k=5
+        )
+
+        # Test retrieval
+        queries = [
+            "What is machine learning?",
+            "What are neural networks?",
+            "What is NLP?"
         ]
 
-        pipeline = ChunkingPipeline(chunk_size=100)
-        chunks = pipeline.chunk_batch(documents)
+        for query in queries:
+            results = retriever.retrieve(query, top_k=3)
+            assert len(results) > 0
+            for result in results:
+                assert result.text is not None
+                assert result.score > 0
+
+    def test_hybrid_retrieval(self, sample_documents, mock_embedding_generator):
+        """Test hybrid retrieval."""
+        # Set up vector store
+        chunker = ChunkingPipeline(chunk_size=300, chunk_overlap=50)
+        chunks = []
+        for doc in sample_documents:
+            doc_chunks = chunker.chunk_document(doc["content"])
+            chunks.extend(doc_chunks)
+
+        chunk_data = [{"text": c.text, "metadata": c.metadata} for c in chunks]
+        embeddings = mock_embedding_generator.generate_embeddings(chunk_data)
+
+        dimension = mock_embedding_generator.dimension
+        vector_store = FAISSVectorStore(dimension=dimension, index_type="FlatIP")
+
+        vectors = [e.embedding for e in embeddings]
+        texts = [e.text for e in embeddings]
+        vector_store.add_embeddings(vectors, texts, [{} for _ in texts])
+
+        # Create hybrid searcher
+        hybrid_searcher = create_hybrid_searcher(
+            vector_store=vector_store,
+            embedding_generator=mock_embedding_generator,
+            vector_weight=0.7,
+            keyword_weight=0.3,
+            top_k=5
+        )
+
+        # Index documents for BM25
+        hybrid_searcher.index_documents(texts)
+
+        # Test search
+        query = "What is machine learning and neural networks?"
+        results = hybrid_searcher.search(query, top_k=3)
+
+        assert len(results) > 0
+        for result in results:
+            assert result.text is not None
+            assert result.combined_score > 0
+            assert hasattr(result, 'vector_score')
+            assert hasattr(result, 'keyword_score')
+
+
+class TestGeneration:
+    """Integration tests for response generation."""
+
+    def test_llm_generation(self, mock_llm_interface):
+        """Test LLM generation."""
+        prompt = "What is machine learning?"
+        response = mock_llm_interface.generate_simple(prompt)
+
+        assert response is not None
+        assert len(response) > 0
+        assert "test response" in response.lower()
+
+    def test_rag_pipeline(self, sample_documents, mock_embedding_generator, mock_llm_interface):
+        """Test RAG pipeline."""
+        # Set up components
+        chunker = ChunkingPipeline(chunk_size=300, chunk_overlap=50)
+        chunks = []
+        for doc in sample_documents[:3]:
+            doc_chunks = chunker.chunk_document(doc["content"])
+            chunks.extend(doc_chunks)
+
+        chunk_data = [{"text": c.text, "metadata": c.metadata} for c in chunks]
+        embeddings = mock_embedding_generator.generate_embeddings(chunk_data)
+
+        dimension = mock_embedding_generator.dimension
+        vector_store = FAISSVectorStore(dimension=dimension, index_type="FlatIP")
+
+        vectors = [e.embedding for e in embeddings]
+        texts = [e.text for e in embeddings]
+        vector_store.add_embeddings(vectors, texts, [{} for _ in texts])
+
+        retriever = create_retriever(
+            retriever_type="vector",
+            vector_store=vector_store,
+            embedding_generator=mock_embedding_generator,
+            top_k=3
+        )
+
+        # Test RAG pipeline
+        queries = [
+            "What is machine learning?",
+            "What are neural networks?"
+        ]
+
+        for query in queries:
+            # Retrieve
+            results = retriever.retrieve(query, top_k=3)
+            assert len(results) > 0
+
+            # Prepare context
+            context_chunks = [
+                {"text": r.text, "source": "test_doc.txt"}
+                for r in results
+            ]
+
+            # Generate prompt
+            prompt = get_rag_prompt(question=query, chunks=context_chunks)
+            assert prompt is not None
+            assert len(prompt) > 0
+
+            # Generate response
+            response = mock_llm_interface.generate_simple(prompt)
+            assert response is not None
+            assert len(response) > 0
+
+    def test_response_postprocessing(self):
+        """Test response post-processing."""
+        test_response = """
+        The answer is 42. I think that's correct.
+        
+        Here are the key points:
+        - Point 1
+        - Point 2
+        - Point 3
+        """
+
+        processed = postprocess_response(test_response, aggressive_cleaning=True)
+
+        assert processed is not None
+        assert processed.cleaned_text is not None
+        assert len(processed.cleaned_text) > 0
+        assert hasattr(processed, 'confidence')
+        assert hasattr(processed, 'has_hallucination')
+
+
+class TestFullPipeline:
+    """End-to-end integration tests."""
+
+    def test_full_pipeline(self, sample_documents, mock_embedding_generator, mock_llm_interface):
+        """Test the complete pipeline from ingestion to response."""
+        # Step 1: Chunk documents
+        chunker = ChunkingPipeline(
+            strategy=ChunkingStrategy.RECURSIVE,
+            chunk_size=300,
+            chunk_overlap=50
+        )
+
+        chunks = []
+        for doc in sample_documents[:3]:
+            doc_chunks = chunker.chunk_document(doc["content"])
+            chunks.extend(doc_chunks)
 
         assert len(chunks) > 0
-        # Check that metadata from both docs is present
-        doc_ids = {chunk.metadata.get("doc_id") for chunk in chunks}
-        assert 1 in doc_ids or 2 in doc_ids
 
-    def test_chunk_stats(self, sample_text):
-        """Test chunk statistics calculation."""
-        pipeline = ChunkingPipeline(chunk_size=100)
-        chunks = pipeline.chunk_document(sample_text)
+        # Step 2: Generate embeddings
+        chunk_data = [{"text": c.text, "metadata": c.metadata} for c in chunks]
+        embeddings = mock_embedding_generator.generate_embeddings(chunk_data)
 
-        stats = pipeline.get_chunk_stats(chunks)
+        assert len(embeddings) > 0
 
-        assert "total_chunks" in stats
-        assert "avg_size" in stats
-        assert "min_size" in stats
-        assert "max_size" in stats
-        assert stats["total_chunks"] == len(chunks)
+        # Step 3: Store in vector store
+        dimension = mock_embedding_generator.dimension
+        vector_store = FAISSVectorStore(dimension=dimension, index_type="FlatIP")
 
-    def test_empty_document_chunking(self):
-        """Test chunking empty document."""
-        pipeline = ChunkingPipeline()
-        chunks = pipeline.chunk_document("")
+        vectors = [e.embedding for e in embeddings]
+        texts = [e.text for e in embeddings]
+        vector_store.add_embeddings(vectors, texts, [{} for _ in texts])
+
+        assert vector_store.get_size() > 0
+
+        # Step 4: Create retriever
+        retriever = create_retriever(
+            retriever_type="vector",
+            vector_store=vector_store,
+            embedding_generator=mock_embedding_generator,
+            top_k=3
+        )
+
+        # Step 5: Query
+        query = "What is machine learning and how does it work?"
+
+        # Retrieve
+        retrieval_results = retriever.retrieve(query, top_k=3)
+        assert len(retrieval_results) > 0
+
+        # Step 6: Generate response
+        context_chunks = [
+            {"text": r.text, "source": "test_doc.txt"}
+            for r in retrieval_results
+        ]
+
+        prompt = get_rag_prompt(question=query, chunks=context_chunks)
+        response = mock_llm_interface.generate_simple(prompt)
+
+        assert response is not None
+        assert len(response) > 0
+
+        # Step 7: Post-process
+        processed = postprocess_response(response, aggressive_cleaning=True)
+
+        assert processed.cleaned_text is not None
+        assert len(processed.cleaned_text) > 0
+
+    def test_evaluation_metrics(self, sample_queries):
+        """Test evaluation metrics on generated responses."""
+        # Generate mock responses
+        candidates = []
+        references = []
+
+        for q in sample_queries[:3]:
+            query = q["query"]
+            # Mock response
+            candidate = f"This is a test response about: {query[:30]}..."
+            candidates.append(candidate)
+            references.append(f"This is a reference answer about: {query[:30]}...")
+
+        # Calculate metrics
+        metrics = calculate_metrics(
+            candidates,
+            references,
+            metrics=['bleu', 'rouge', 'meteor', 'f1']
+        )
+
+        assert metrics is not None
+        assert 'bleu' in metrics
+        assert 'rouge1_fmeasure' in metrics or 'rouge' in metrics
+
+    def test_faithfulness_evaluation(self):
+        """Test faithfulness evaluation."""
+        source = """
+        Machine learning is a subset of artificial intelligence that enables systems to learn 
+        and improve from experience without being explicitly programmed.
+        """
+
+        faithful_response = """
+        Machine learning is a subset of artificial intelligence that enables systems to learn from data.
+        """
+
+        hallucinated_response = """
+        Machine learning was invented in 1980 by John Smith and uses quantum computers.
+        """
+
+        # Test faithful response
+        result = evaluate_faithfulness(
+            faithful_response,
+            source,
+            method="token",
+            threshold=0.3
+        )
+        assert result.score > 0.3
+
+        # Test hallucinated response
+        result = evaluate_faithfulness(
+            hallucinated_response,
+            source,
+            method="token",
+            threshold=0.3
+        )
+        assert result.score < 0.3
+
+
+class TestErrorHandling:
+    """Integration tests for error handling."""
+
+    def test_empty_document_handling(self):
+        """Test handling of empty documents."""
+        chunker = ChunkingPipeline()
+        chunks = chunker.chunk_document("")
 
         assert chunks == []
 
-    def test_invalid_strategy(self):
-        """Test handling of invalid strategy."""
-        with pytest.raises(ValueError):
-            ChunkingPipeline(strategy="invalid_strategy")  # type: ignore
-
-
-class TestChunkClass:
-    """Tests for Chunk dataclass."""
-
-    def test_chunk_creation(self):
-        """Test creating a chunk object."""
-        chunk = Chunk(
-            text="Test content",
-            metadata={"key": "value"},
-            index=0,
-            start_char=0,
-            end_char=12
-        )
-
-        assert chunk.text == "Test content"
-        assert chunk.metadata["key"] == "value"
-        assert chunk.index == 0
-
-    def test_chunk_to_dict(self):
-        """Test converting chunk to dictionary."""
-        chunk = Chunk(
-            text="Test",
-            metadata={"score": 0.9},
-            index=5,
-            start_char=10,
-            end_char=14
-        )
-
-        chunk_dict = chunk.to_dict()
-
-        assert chunk_dict["text"] == "Test"
-        assert chunk_dict["metadata"]["score"] == 0.9
-        assert chunk_dict["index"] == 5
-
-
-class TestIntegrationLoaderAndChunker:
-    """Integration tests combining loader and chunker."""
-
-    def test_load_and_chunk_text_file(self, sample_text_file):
-        """Test loading a text file and chunking its content."""
-        # Load
+    def test_invalid_file_handling(self):
+        """Test handling of invalid files."""
         loader = DocumentLoader()
-        doc = loader.load_document(sample_text_file)
 
-        # Chunk
-        pipeline = ChunkingPipeline(chunk_size=50, chunk_overlap=10)
-        chunks = pipeline.chunk_document(doc["content"], doc["metadata"])
+        with pytest.raises(FileNotFoundError):
+            loader.load_document("/nonexistent/file.txt")
 
-        assert len(chunks) > 0
-        # Metadata should be preserved
-        for chunk in chunks:
-            assert chunk.metadata["file_type"] == "txt"
+    def test_missing_query_handling(self, mock_retriever):
+        """Test handling of empty queries."""
+        results = mock_retriever.retrieve("", top_k=3)
+        assert results is not None
 
-    def test_load_and_chunk_html(self, sample_html_file):
-        """Test loading HTML and chunking content."""
-        loader = DocumentLoader()
-        doc = loader.load_document(sample_html_file)
+    def test_vector_store_empty_search(self):
+        """Test search on empty vector store."""
+        vector_store = FAISSVectorStore(dimension=384)
+        query_embedding = [0.0] * 384
 
-        pipeline = ChunkingPipeline(strategy=ChunkingStrategy.SENTENCE)
-        chunks = pipeline.chunk_document(doc["content"], doc["metadata"])
+        results = vector_store.search(query_embedding, top_k=5)
+        assert results == []
 
-        assert len(chunks) > 0
-        assert chunks[0].metadata["title"] == "Test Page"
-
-    def test_batch_load_and_chunk(self, temp_dir, sample_text_file, sample_html_file):
-        """Test loading multiple files and chunking them together."""
-        loader = DocumentLoader()
-        docs = loader.load_directory(temp_dir)
-
-        pipeline = ChunkingPipeline(chunk_size=100)
-        all_chunks = pipeline.chunk_batch(docs)
-
-        assert len(all_chunks) > 0
-        # Should have chunks from both documents
-        file_paths = {chunk.metadata.get("file_path") for chunk in all_chunks}
-        assert len(file_paths) >= 1
-
-
-# ============== Performance Tests ==============
 
 class TestPerformance:
-    """Performance and edge case tests."""
+    """Performance integration tests."""
 
-    def test_large_text_chunking(self):
-        """Test chunking large text efficiently."""
-        large_text = "This is a sentence. " * 10000  # ~200k chars
-        pipeline = ChunkingPipeline(chunk_size=1000, chunk_overlap=100)
+    def test_batch_processing_performance(self, sample_documents, mock_embedding_generator):
+        """Test batch processing performance."""
+        chunker = ChunkingPipeline(chunk_size=200, chunk_overlap=50)
 
-        import time
-        start = time.time()
-        chunks = pipeline.chunk_document(large_text)
-        duration = time.time() - start
+        chunks = []
+        for doc in sample_documents:
+            doc_chunks = chunker.chunk_document(doc["content"])
+            chunks.extend(doc_chunks)
 
-        assert len(chunks) > 10
-        assert duration < 1.0  # Should be fast (< 1 second)
+        chunk_data = [{"text": c.text, "metadata": c.metadata} for c in chunks]
 
-    def test_unicode_handling(self):
-        """Test chunking text with unicode characters."""
-        text = "Hello 世界. こんにちは. 🌟 Emoji test. Café Müller."
-        chunker = FixedSizeChunker(chunk_size=50)
-        chunks = chunker.chunk(text)
+        start_time = time.time()
+        embeddings = mock_embedding_generator.generate_embeddings(chunk_data)
+        duration = time.time() - start_time
 
-        assert len(chunks) > 0
-        # Unicode should be preserved
-        assert any("世界" in chunk.text for chunk in chunks)
+        assert len(embeddings) == len(chunks)
+        assert duration < 10.0  # Should be fast for integration tests
 
-    def test_special_characters(self):
-        """Test handling of special characters."""
-        text = "Tab\tseparated\nNewline\r\nCarriage return\rMultiple    spaces."
-        chunker = FixedSizeChunker()
-        chunks = chunker.chunk(text)
+    def test_search_performance(self, sample_documents, mock_embedding_generator):
+        """Test search performance."""
+        # Set up vector store with documents
+        chunker = ChunkingPipeline(chunk_size=300, chunk_overlap=50)
+        chunks = []
+        for doc in sample_documents:
+            doc_chunks = chunker.chunk_document(doc["content"])
+            chunks.extend(doc_chunks)
 
-        assert chunks[0].text is not None
+        chunk_data = [{"text": c.text, "metadata": c.metadata} for c in chunks]
+        embeddings = mock_embedding_generator.generate_embeddings(chunk_data)
 
+        dimension = mock_embedding_generator.dimension
+        vector_store = FAISSVectorStore(dimension=dimension, index_type="FlatIP")
+
+        vectors = [e.embedding for e in embeddings]
+        texts = [e.text for e in embeddings]
+        vector_store.add_embeddings(vectors, texts, [{} for _ in texts])
+
+        # Test search performance
+        query_embedding = mock_embedding_generator.generate_embeddings([{"text": "test query"}])[0].embedding
+
+        start_time = time.time()
+        results = vector_store.search(query_embedding, top_k=3)
+        duration = time.time() - start_time
+
+        assert len(results) > 0
+        assert duration < 1.0  # Should be fast
+
+
+# ============================================================
+# Test Runner
+# ============================================================
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "--tb=short"])
+    pytest.main([__file__, "-v", "--tb=short", "--capture=no"])

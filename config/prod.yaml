@@ -1,0 +1,389 @@
+# ============================================================================
+# DocQA AI - Production Configuration
+# ============================================================================
+# This configuration is optimized for production deployment.
+# DO NOT commit this file with real secrets. Use environment variables instead.
+# ============================================================================
+
+# ============================================================================
+# Application Settings
+# ============================================================================
+environment: production
+debug: false
+version: "1.0.0"
+
+# ============================================================================
+# LLM Configuration
+# ============================================================================
+llm:
+  provider: openai  # openai, anthropic, azure, gemini, cohere, groq, local
+  model: gpt-4
+  temperature: 0.3  # Lower for production to ensure consistent responses
+  max_tokens: 2000
+  top_p: 0.9
+  frequency_penalty: 0.0
+  presence_penalty: 0.0
+  timeout: 60
+  max_retries: 5
+  # API keys should be set via environment variables:
+  # OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.
+
+# ============================================================================
+# Embedding Configuration
+# ============================================================================
+embedding:
+  provider: openai  # openai, sentence-transformers, local
+  model: text-embedding-3-small
+  dimension: 1536
+  batch_size: 50  # Optimized for production throughput
+  max_tokens: 8191
+  cache_enabled: true
+  cache_dir: /app/data/embeddings/cache
+  # API keys should be set via environment variables
+
+# ============================================================================
+# Vector Store Configuration
+# ============================================================================
+vector_store:
+  store_type: faiss  # faiss, chromadb, qdrant, pinecone
+  index_type: HNSW64  # Optimized for production: HNSW64 or HNSW128
+  index_path: /app/data/vector_store
+  dimension: 1536
+  metric: cosine
+  ef_search: 200  # Higher for better recall in production
+  ef_construction: 400  # Higher for better index quality
+  m: 32  # Higher for better recall in production
+
+  # Alternative: Use Qdrant for production (uncomment to use)
+  # qdrant_host: qdrant
+  # qdrant_port: 6333
+  # qdrant_collection: documents
+
+# ============================================================================
+# Retrieval Configuration
+# ============================================================================
+retrieval:
+  top_k: 5
+  score_threshold: 0.6
+  enable_hybrid_search: true
+  enable_reranking: true
+  reranker_model: cross-encoder/ms-marco-MiniLM-L-6-v2
+  vector_weight: 0.6
+  keyword_weight: 0.4
+  mmr_diversity: 0.5
+  use_query_expansion: true
+  expansion_terms: 3
+  max_retries: 3
+
+# ============================================================================
+# API Configuration
+# ============================================================================
+api:
+  host: 0.0.0.0
+  port: 8000
+  workers: 8  # Number of worker processes
+  reload: false
+  log_level: WARNING
+  cors_origins:
+    - https://docqa-ai.com
+    - https://api.docqa-ai.com
+    - https://*.docqa-ai.com
+  cors_credentials: true
+  rate_limit: 1000/minute  # Higher for production
+  request_timeout: 60
+  max_request_size: 104857600  # 100MB
+  enable_compression: true
+  enable_ssl: true
+  ssl_cert_path: /etc/ssl/certs/docqa-cert.pem
+  ssl_key_path: /etc/ssl/private/docqa-key.pem
+
+# ============================================================================
+# Authentication Configuration
+# ============================================================================
+auth:
+  enabled: true
+  jwt_algorithm: HS256
+  jwt_expiration_hours: 24
+  refresh_token_expiration_days: 7
+  password_min_length: 12
+  max_login_attempts: 5
+  lockout_duration_minutes: 30
+  session_timeout_minutes: 60
+  # JWT secret should be set via environment variable: JWT_SECRET_KEY
+  # API keys should be set via environment variables
+
+# ============================================================================
+# Database Configuration
+# ============================================================================
+database:
+  # Use PostgreSQL for production
+  url: postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
+  pool_size: 20
+  max_overflow: 40
+  pool_timeout: 30
+  pool_recycle: 3600
+  echo: false
+  ssl_mode: require
+  # For connection pooling
+  pool_pre_ping: true
+  pool_use_lifo: true
+
+# ============================================================================
+# Cache Configuration
+# ============================================================================
+cache:
+  enabled: true
+  redis_url: redis://${REDIS_HOST}:${REDIS_PORT}/${REDIS_DB}
+  redis_password: ${REDIS_PASSWORD}
+  ttl_seconds: 7200  # 2 hours
+  max_size: 10000
+  # Redis Sentinel (optional)
+  # redis_sentinel_hosts: sentinel1:26379,sentinel2:26379
+  # redis_sentinel_master: docqa
+  # redis_sentinel_password: ${REDIS_SENTINEL_PASSWORD}
+
+# ============================================================================
+# Document Processing Configuration
+# ============================================================================
+processing:
+  max_file_size_mb: 50  # Lower for production
+  supported_extensions:
+    - .pdf
+    - .docx
+    - .txt
+    - .md
+    - .html
+    - .csv
+    - .json
+  chunk_size: 800  # Optimized for production
+  chunk_overlap: 150
+  chunking_strategy: adaptive
+  language: en
+  preserve_formatting: true
+  extract_tables: true
+  extract_images: false
+  max_paragraphs: 50000
+  max_documents_per_batch: 100
+  # Parallel processing settings
+  max_workers: 8
+  chunk_processing_timeout: 300
+
+# ============================================================================
+# Monitoring Configuration
+# ============================================================================
+monitoring:
+  enabled: true
+  metrics_port: 9090
+  enable_tracing: true
+  jaeger_agent_host: jaeger
+  jaeger_agent_port: 6831
+  log_requests: true
+  log_responses: false
+  log_body_size: 1024  # Log only first 1KB of responses
+  # Prometheus metrics
+  prometheus_enabled: true
+  prometheus_path: /metrics
+  # Health check
+  health_check_interval: 30
+  health_check_timeout: 5
+  # Alerting
+  alert_on_high_latency: true
+  latency_threshold_ms: 1000
+  alert_on_high_error_rate: true
+  error_rate_threshold: 0.05
+
+# ============================================================================
+# Logging Configuration
+# ============================================================================
+logging:
+  level: INFO
+  format: json  # json, text
+  directory: /var/log/docqa
+  max_size_mb: 100
+  backup_count: 10
+  compress_old_logs: true
+  # Log to external services (optional)
+  # logstash_host: logstash:5000
+  # elasticsearch_host: elasticsearch:9200
+  # slack_webhook_url: ${SLACK_WEBHOOK_URL}
+
+# ============================================================================
+# Rate Limiting Configuration
+# ============================================================================
+rate_limiting:
+  enabled: true
+  redis_url: redis://${REDIS_HOST}:${REDIS_PORT}/${REDIS_DB}
+  default_limits:
+    max_requests: 1000
+    window_seconds: 60
+  endpoints:
+    /api/v1/query:
+      max_requests: 100
+      window_seconds: 60
+    /api/v1/query/stream:
+      max_requests: 50
+      window_seconds: 60
+    /api/v1/documents/ingest:
+      max_requests: 10
+      window_seconds: 60
+    /api/v1/documents/*:
+      max_requests: 50
+      window_seconds: 60
+    /health:
+      max_requests: 1000
+      window_seconds: 60
+    /metrics:
+      max_requests: 1000
+      window_seconds: 60
+  # Tier-based rate limits
+  tiers:
+    free:
+      max_requests: 100
+      window_seconds: 60
+    pro:
+      max_requests: 1000
+      window_seconds: 60
+    enterprise:
+      max_requests: 10000
+      window_seconds: 60
+
+# ============================================================================
+# Security Configuration
+# ============================================================================
+security:
+  allowed_hosts:
+    - docqa-ai.com
+    - api.docqa-ai.com
+    - *.docqa-ai.com
+  trusted_proxies:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+  ip_blocking_enabled: false
+  blocked_ips: []
+  # CSP Headers
+  content_security_policy: "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';"
+  # Rate limiting per IP
+  rate_limit_by_ip: true
+  rate_limit_by_api_key: true
+  # API key rotation
+  api_key_rotation_days: 90
+
+# ============================================================================
+# Feature Flags
+# ============================================================================
+features:
+  websocket_enabled: true
+  file_upload_enabled: true
+  document_delete_enabled: true
+  document_list_enabled: true
+  metrics_enabled: true
+  batch_query_enabled: true
+  streaming_enabled: true
+  versioning_enabled: true
+  export_enabled: true
+  webhook_enabled: false
+
+# ============================================================================
+# Performance Optimization
+# ============================================================================
+performance:
+  # Connection pooling
+  max_connections: 100
+  keep_alive: true
+  keep_alive_timeout: 60
+
+  # Caching
+  cache_embeddings: true
+  cache_query_results: true
+  cache_ttl_seconds: 3600
+
+  # Batch processing
+  batch_size: 100
+  max_batch_workers: 10
+
+  # Database
+  db_pool_size: 20
+  db_max_overflow: 40
+
+  # Vector store
+  vector_index_cache: true
+  vector_search_batch_size: 100
+
+# ============================================================================
+# Cloud Provider Configuration (Optional)
+# ============================================================================
+cloud:
+  provider: aws  # aws, azure, gcp
+  # AWS
+  aws_region: us-east-1
+  aws_s3_bucket: docqa-ai-prod
+  aws_s3_embeddings_bucket: docqa-ai-embeddings-prod
+  # Azure (if using Azure)
+  # azure_storage_account: docqa
+  # azure_container: docqa-documents
+  # GCP (if using GCP)
+  # gcp_project_id: docqa-ai
+  # gcs_bucket: docqa-ai-prod
+
+# ============================================================================
+# Backup Configuration
+# ============================================================================
+backup:
+  enabled: true
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  retention_days: 30
+  backup_dir: /backups/docqa
+  include_embeddings: true
+  include_metadata: true
+  compression: true
+  # S3 backup (optional)
+  # s3_bucket: docqa-ai-backups
+  # s3_path: backups/
+
+# ============================================================================
+# Maintenance Configuration
+# ============================================================================
+maintenance:
+  enabled: false
+  mode: read_only  # read_only, full_maintenance
+  message: "System is currently undergoing maintenance. Please try again later."
+  scheduled_maintenance:
+    enabled: true
+    schedule: "0 3 * * 0"  # Weekly on Sunday at 3 AM
+    duration_hours: 2
+
+# ============================================================================
+# Notifications Configuration
+# ============================================================================
+notifications:
+  enabled: true
+  # Email
+  email_enabled: true
+  smtp_host: ${SMTP_HOST}
+  smtp_port: 587
+  smtp_user: ${SMTP_USER}
+  smtp_password: ${SMTP_PASSWORD}
+  from_email: noreply@docqa-ai.com
+  # Slack
+  slack_enabled: false
+  slack_webhook_url: ${SLACK_WEBHOOK_URL}
+  # PagerDuty
+  pagerduty_enabled: false
+  pagerduty_service_key: ${PAGERDUTY_SERVICE_KEY}
+
+# ============================================================================
+# Audit Configuration
+# ============================================================================
+audit:
+  enabled: true
+  log_all_requests: true
+  log_all_queries: true
+  log_authentication: true
+  log_data_access: true
+  audit_log_file: /var/log/docqa/audit.log
+  retention_days: 90
+  # Compliance
+  gdpr_compliance: true
+  hipaa_compliance: false
+  soc2_compliance: true

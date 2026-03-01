@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Load testing script for DocQA AI system.
+Load testing script for the DocQA AI system.
 Tests API performance under various load conditions with configurable parameters.
 """
 

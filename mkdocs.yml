@@ -1,0 +1,222 @@
+# ============================================================================
+# DocQA AI - MkDocs Configuration
+# ============================================================================
+
+site_name: DocQA AI Documentation
+site_description: Production-ready RAG system for document question answering
+site_author: DocQA AI Team
+site_url: https://docqa-ai.readthedocs.io/
+
+# Repository
+repo_name: yourusername/docqa-ai
+repo_url: https://github.com/yourusername/docqa-ai
+edit_uri: edit/main/docs/
+
+# Copyright
+copyright: Copyright &copy; 2026 DocQA AI
+
+# Theme
+theme:
+  name: material
+  language: en
+  palette:
+    # Light mode
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    # Dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.indexes
+    - navigation.instant
+    - navigation.instant.prefetch
+    - navigation.instant.progress
+    - search.suggest
+    - search.highlight
+    - search.share
+    - toc.follow
+    - toc.integrate
+    - content.code.annotate
+    - content.code.copy
+    - content.tabs.link
+    - content.tooltips
+    - header.autohide
+    - announce.dismiss
+
+  icon:
+    repo: fontawesome/brands/github
+    logo: material/chat-question
+    admonition:
+      note: fontawesome/solid/note-sticky
+      abstract: fontawesome/solid/list-ul
+      info: fontawesome/solid/circle-info
+      tip: fontawesome/solid/lightbulb
+      success: fontawesome/solid/check
+      question: fontawesome/solid/circle-question
+      warning: fontawesome/solid/triangle-exclamation
+      failure: fontawesome/solid/bomb
+      danger: fontawesome/solid/skull
+      bug: fontawesome/solid/robot
+      example: fontawesome/solid/flask
+      quote: fontawesome/solid/quote-left
+
+# Extensions
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - toc:
+      permalink: true
+  - tables
+  - footnotes
+  - attr_list
+  - md_in_html
+  - def_list
+
+# Plugins
+plugins:
+  - search:
+      separator: '[\s\-,:!=\[\]()"`/]+|\.(?!\d)|&[lg]t;|(?!\b)(?=[A-Z][a-z])'
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          options:
+            docstring_style: google
+            show_source: true
+            show_root_heading: true
+            show_root_full_path: false
+            show_category_heading: true
+            members_order: source
+            separate_signature: true
+            show_signature_annotations: true
+            show_docstring_examples: true
+  - git-revision-date-localized:
+      enable_creation_date: true
+      type: datetime
+  - minify:
+      minify_html: true
+      minify_js: true
+      minify_css: true
+  - awesome-pages:
+      collapse_single_pages: true
+  - glightbox:
+      touchNavigation: true
+      loop: false
+      effect: zoom
+      slide_effect: slide
+      width: 100%
+      height: auto
+      zoomable: true
+      draggable: true
+      skip_classes:
+        - custom-skip-class-name
+      auto_caption: false
+      caption_position: bottom
+  - social:
+      cards_layout_options:
+        title: DocQA AI Documentation
+
+# Extra CSS and JS
+extra_css:
+  - stylesheets/extra.css
+
+extra_javascript:
+  - javascripts/extra.js
+
+# Extra config
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/yourusername/docqa-ai
+    - icon: fontawesome/brands/discord
+      link: https://discord.gg/your-invite
+    - icon: fontawesome/brands/twitter
+      link: https://twitter.com/docqa_ai
+    - icon: fontawesome/brands/linkedin
+      link: https://linkedin.com/company/docqa-ai
+    - icon: fontawesome/brands/youtube
+      link: https://youtube.com/@docqa-ai
+  version:
+    provider: mike
+    default: latest
+
+# Navigation
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Introduction: getting-started/index.md
+      - Installation: getting-started/installation.md
+      - Quick Start: getting-started/quickstart.md
+      - Configuration: getting-started/configuration.md
+  - User Guide:
+      - Document Management: user-guide/documents.md
+      - Querying: user-guide/querying.md
+      - Streaming: user-guide/streaming.md
+      - WebSocket: user-guide/websocket.md
+      - Frontend UI: user-guide/frontend.md
+  - API Reference:
+      - Overview: api/index.md
+      - Authentication: api/authentication.md
+      - Endpoints: api/endpoints.md
+      - WebSocket: api/websocket.md
+      - Schemas: api/schemas.md
+      - Error Handling: api/errors.md
+      - Rate Limiting: api/rate-limiting.md
+  - Development:
+      - Architecture: development/architecture.md
+      - Contributing: development/contributing.md
+      - Testing: development/testing.md
+      - CI/CD: development/cicd.md
+      - Deployment: development/deployment.md
+  - Evaluation:
+      - Metrics: evaluation/metrics.md
+      - Benchmarks: evaluation/benchmarks.md
+      - Faithfulness: evaluation/faithfulness.md
+      - Relevance: evaluation/relevance.md
+  - Examples:
+      - Python SDK: examples/python.md
+      - JavaScript SDK: examples/javascript.md
+      - REST API: examples/rest-api.md
+      - WebSocket: examples/websocket.md
+      - Jupyter Notebook: examples/notebook.md
+  - Deployment:
+      - Docker: deployment/docker.md
+      - Kubernetes: deployment/kubernetes.md
+      - AWS: deployment/aws.md
+      - Azure: deployment/azure.md
+      - GCP: deployment/gcp.md
+  - Monitoring:
+      - Metrics: monitoring/metrics.md
+      - Logging: monitoring/logging.md
+      - Tracing: monitoring/tracing.md
+      - Alerts: monitoring/alerts.md
+  - FAQ: faq.md
+  - Changelog: changelog.md

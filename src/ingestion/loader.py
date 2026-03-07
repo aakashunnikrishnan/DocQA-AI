@@ -1,6 +1,6 @@
 """
-Document loader module with support for multiple file formats including PDF, DOCX, and HTML.
-ENHANCED: Full HTML support with BeautifulSoup parsing, metadata extraction, and content cleaning.
+Document loader module with support for multiple file formats including PDF, DOCX, HTML, and CSV.
+ENHANCED: Full CSV support with automatic delimiter detection, encoding handling, and metadata extraction.
 """
 
 import os
@@ -16,6 +16,9 @@ from dataclasses import dataclass, field
 from contextlib import contextmanager
 import re
 from urllib.parse import urlparse, urljoin
+import csv
+import io
+import chardet
 
 import PyPDF2
 from docx import Document
@@ -23,9 +26,7 @@ from docx.text.paragraph import Paragraph
 from docx.table import Table, _Cell
 from bs4 import BeautifulSoup, Comment, NavigableString
 import markdown
-import csv
 import json
-import chardet
 
 logger = logging.getLogger(__name__)
 
@@ -252,7 +253,409 @@ class BaseLoader(ABC):
 
 
 # ============================================================
-# HTML Loader - NEW ENHANCED IMPLEMENTATION
+# CSV Loader - NEW ENHANCED IMPLEMENTATION
+# ============================================================
+
+class CSVLoader(BaseLoader):
+    """
+    Enhanced CSV document loader with support for:
+    - Automatic delimiter detection
+    - Encoding detection
+    - Header detection
+    - Large file streaming
+    - Column type inference
+    - Metadata extraction
+    - Multiple CSV formats
+    """
+
+    def __init__(
+        self,
+        timeout: int = 60,
+        max_file_size_mb: int = 100,
+        max_memory_mb: int = 2048,
+        chunk_size: int = 1024 * 1024,
+        auto_detect_delimiter: bool = True,
+        auto_detect_encoding: bool = True,
+        max_rows: int = 100000,
+        max_columns: int = 1000,
+        infer_column_types: bool = True,
+        include_headers: bool = True,
+        delimiter: Optional[str] = None
+    ):
+        """
+        Initialize CSV loader.
+
+        Args:
+            timeout: Maximum time in seconds for loading operations
+            max_file_size_mb: Maximum file size in MB
+            max_memory_mb: Maximum memory usage in MB
+            chunk_size: Chunk size for streaming reads
+            auto_detect_delimiter: Auto-detect delimiter
+            auto_detect_encoding: Auto-detect encoding
+            max_rows: Maximum rows to process
+            max_columns: Maximum columns to process
+            infer_column_types: Infer column types
+            include_headers: Include headers in output
+            delimiter: Manual delimiter override
+        """
+        super().__init__(timeout, max_file_size_mb, max_memory_mb, chunk_size)
+        self.auto_detect_delimiter = auto_detect_delimiter
+        self.auto_detect_encoding = auto_detect_encoding
+        self.max_rows = max_rows
+        self.max_columns = max_columns
+        self.infer_column_types = infer_column_types
+        self.include_headers = include_headers
+        self.delimiter = delimiter
+
+        # Common delimiters to detect
+        self.delimiters = [',', ';', '\t', '|', ':', ' ']
+
+        logger.info(f"CSVLoader initialized: max_rows={max_rows}, "
+                   f"auto_detect_delimiter={auto_detect_delimiter}, "
+                   f"auto_detect_encoding={auto_detect_encoding}")
+
+    @handle_loader_errors()
+    def load(self, file_path: str) -> LoaderResult:
+        """
+        Load and parse CSV file.
+
+        Args:
+            file_path: Path to CSV file
+
+        Returns:
+            LoaderResult with content and metadata
+        """
+        is_valid, error_code, error_msg = self.validate_file(file_path)
+        if not is_valid:
+            return LoaderResult(
+                success=False,
+                error_code=error_code,
+                error_message=error_msg,
+                file_path=file_path
+            )
+
+        warnings = []
+        metadata = self.get_metadata(file_path)
+        file_size = Path(file_path).stat().st_size
+
+        try:
+            # Detect encoding
+            encoding = self._detect_encoding(file_path) if self.auto_detect_encoding else 'utf-8'
+            metadata["encoding"] = encoding
+
+            # Detect delimiter
+            delimiter = self._detect_delimiter(file_path, encoding) if self.auto_detect_delimiter else (self.delimiter or ',')
+            metadata["delimiter"] = delimiter
+
+            # Read and parse CSV
+            content, csv_metadata = self._parse_csv(file_path, encoding, delimiter)
+
+            # Update metadata
+            metadata.update(csv_metadata)
+
+            if not content:
+                raise ParsingError("No content extracted from CSV")
+
+        except Exception as e:
+            raise ParsingError(f"Failed to load CSV: {e}")
+
+        return LoaderResult(
+            success=True,
+            content=content,
+            metadata=metadata,
+            file_path=file_path,
+            file_size=file_size,
+            warnings=warnings,
+            memory_usage_mb=get_memory_usage()
+        )
+
+    def _detect_encoding(self, file_path: str) -> str:
+        """Detect file encoding."""
+        try:
+            with open(file_path, 'rb') as f:
+                raw_data = f.read(10000)
+                result = chardet.detect(raw_data)
+                return result.get('encoding', 'utf-8')
+        except Exception:
+            return 'utf-8'
+
+    def _detect_delimiter(self, file_path: str, encoding: str) -> str:
+        """
+        Detect delimiter by analyzing the first few lines of the file.
+
+        Returns:
+            Detected delimiter
+        """
+        try:
+            with open(file_path, 'r', encoding=encoding) as f:
+                sample = f.read(5000)
+
+            # Count occurrences of each delimiter
+            delimiter_counts = {}
+            for delim in self.delimiters:
+                count = sample.count(delim)
+                if count > 0:
+                    delimiter_counts[delim] = count
+
+            if not delimiter_counts:
+                return ','
+
+            # Return delimiter with highest count (excluding spaces if too common)
+            if ' ' in delimiter_counts:
+                # If space is most common, check if it's likely the delimiter
+                space_count = delimiter_counts[' ']
+                other_counts = [c for d, c in delimiter_counts.items() if d != ' ']
+                if other_counts and max(other_counts) < space_count * 0.5:
+                    # Space is likely just word spacing, not delimiter
+                    del delimiter_counts[' ']
+
+            return max(delimiter_counts.items(), key=lambda x: x[1])[0] if delimiter_counts else ','
+
+        except Exception:
+            return ',' if self.delimiter is None else self.delimiter
+
+    def _parse_csv(
+        self,
+        file_path: str,
+        encoding: str,
+        delimiter: str
+    ) -> Tuple[str, Dict[str, Any]]:
+        """
+        Parse CSV file and return formatted content.
+
+        Args:
+            file_path: Path to CSV file
+            encoding: File encoding
+            delimiter: CSV delimiter
+
+        Returns:
+            Tuple of (content_string, metadata)
+        """
+        metadata = {
+            "num_rows": 0,
+            "num_columns": 0,
+            "column_names": [],
+            "column_types": {},
+            "sample_data": [],
+            "has_header": False
+        }
+
+        content_parts = []
+        rows_processed = 0
+        has_header = False
+        headers = []
+        sample_rows = []
+
+        try:
+            with open(file_path, 'r', encoding=encoding) as f:
+                # Use Sniffer to detect format
+                try:
+                    sample = f.read(10240)
+                    f.seek(0)
+                    dialect = csv.Sniffer().sniff(sample, delimiters=self.delimiters)
+
+                    # Override delimiter with detected dialect
+                    if dialect.delimiter:
+                        delimiter = dialect.delimiter
+
+                    has_header = csv.Sniffer().has_header(sample)
+                    metadata["has_header"] = has_header
+
+                except Exception as e:
+                    logger.debug(f"CSV Sniffer failed: {e}, using manual parsing")
+
+                # Create CSV reader
+                reader = csv.reader(f, delimiter=delimiter)
+
+                # Read rows
+                for row_num, row in enumerate(reader):
+                    if rows_processed >= self.max_rows:
+                        warnings.append(f"Reached maximum rows limit ({self.max_rows})")
+                        break
+
+                    # Clean and limit columns
+                    cleaned_row = [cell.strip() for cell in row[:self.max_columns]]
+
+                    if rows_processed == 0 and has_header:
+                        headers = cleaned_row
+                        content_parts.append("Columns: " + ", ".join(headers))
+                        metadata["column_names"] = headers
+                        rows_processed += 1
+                        continue
+
+                    # If no headers detected, use column numbers
+                    if rows_processed == 0 and not has_header:
+                        headers = [f"Column_{i+1}" for i in range(len(cleaned_row))]
+                        content_parts.append("Columns: " + ", ".join(headers))
+                        metadata["column_names"] = headers
+                        rows_processed += 1
+
+                    # Build row content
+                    row_content = f"Row {row_num + 1}: "
+                    row_parts = []
+
+                    for i, value in enumerate(cleaned_row):
+                        col_name = headers[i] if i < len(headers) else f"Col_{i+1}"
+                        row_parts.append(f"{col_name}: {value}")
+
+                    row_content += " | ".join(row_parts)
+                    content_parts.append(row_content)
+
+                    # Store sample rows
+                    if len(sample_rows) < 5:
+                        sample_rows.append({
+                            "row": row_num + 1,
+                            "data": dict(zip(headers, cleaned_row))
+                        })
+
+                    rows_processed += 1
+
+        except Exception as e:
+            raise ParsingError(f"Failed to parse CSV: {e}")
+
+        # Update metadata
+        metadata["num_rows"] = rows_processed
+        metadata["num_columns"] = len(headers)
+        metadata["sample_data"] = sample_rows
+
+        # Infer column types
+        if self.infer_column_types and sample_rows:
+            metadata["column_types"] = self._infer_column_types(sample_rows, headers)
+
+        # Join content
+        content = "\n".join(content_parts)
+
+        # Add summary
+        summary = f"\n\n=== CSV Summary ===\n"
+        summary += f"Rows: {rows_processed}\n"
+        summary += f"Columns: {len(headers)}\n"
+        summary += f"Headers: {', '.join(headers[:20])}\n"
+        content += summary
+
+        return content, metadata
+
+    def _infer_column_types(
+        self,
+        sample_rows: List[Dict[str, Any]],
+        headers: List[str]
+    ) -> Dict[str, str]:
+        """
+        Infer column types from sample data.
+
+        Returns:
+            Dictionary mapping column names to types
+        """
+        column_types = {}
+
+        if not sample_rows:
+            return column_types
+
+        for col in headers:
+            values = []
+            for row in sample_rows:
+                if col in row:
+                    values.append(row[col])
+
+            if not values:
+                column_types[col] = "empty"
+                continue
+
+            # Check for numeric
+            numeric_values = []
+            is_numeric = True
+            for val in values:
+                if val is None or val == '':
+                    continue
+                try:
+                    float(val.replace(',', '').replace('%', ''))
+                    numeric_values.append(val)
+                except ValueError:
+                    is_numeric = False
+                    break
+
+            if is_numeric and numeric_values:
+                # Check if integer or float
+                all_int = all(
+                    v.replace(',', '').replace('%', '').split('.')[1] == '0'
+                    for v in numeric_values
+                    if '.' in v
+                )
+                column_types[col] = "integer" if all_int else "float"
+                continue
+
+            # Check for boolean
+            bool_values = {'true', 'false', 'yes', 'no', '0', '1', 'on', 'off'}
+            if all(str(v).lower() in bool_values for v in values if v):
+                column_types[col] = "boolean"
+                continue
+
+            # Check for date
+            date_patterns = [
+                r'\d{4}-\d{2}-\d{2}',  # YYYY-MM-DD
+                r'\d{2}/\d{2}/\d{4}',  # MM/DD/YYYY
+                r'\d{2}-\d{2}-\d{4}',  # MM-DD-YYYY
+            ]
+            if all(
+                any(re.match(p, str(v)) for p in date_patterns)
+                for v in values
+                if v
+            ):
+                column_types[col] = "date"
+                continue
+
+            # Default to string
+            column_types[col] = "string"
+
+        return column_types
+
+    def get_metadata(self, file_path: str) -> Dict[str, Any]:
+        """Extract CSV metadata."""
+        metadata = {
+            "file_path": file_path,
+            "file_type": "csv",
+            "file_size": Path(file_path).stat().st_size,
+            "encoding": "unknown",
+            "delimiter": "unknown",
+            "has_header": False,
+            "num_rows": 0,
+            "num_columns": 0,
+            "column_names": [],
+            "column_types": {}
+        }
+
+        try:
+            # Get basic file info
+            path = Path(file_path)
+            metadata["file_size"] = path.stat().st_size
+            metadata["file_name"] = path.name
+
+            # Try to read first few lines for metadata
+            try:
+                encoding = self._detect_encoding(file_path)
+                metadata["encoding"] = encoding
+
+                with open(file_path, 'r', encoding=encoding) as f:
+                    sample = f.read(10240)
+
+                    # Detect delimiter
+                    try:
+                        dialect = csv.Sniffer().sniff(sample, delimiters=self.delimiters)
+                        metadata["delimiter"] = dialect.delimiter
+                        metadata["has_header"] = csv.Sniffer().has_header(sample)
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                logger.warning(f"Failed to extract metadata from {file_path}: {e}")
+
+        except Exception as e:
+            logger.warning(f"Failed to extract metadata from {file_path}: {e}")
+
+        return metadata
+
+
+# ============================================================
+# HTML Loader
 # ============================================================
 
 class HTMLLoader(BaseLoader):
@@ -280,21 +683,6 @@ class HTMLLoader(BaseLoader):
         clean_content: bool = True,
         max_content_length: int = 1000000  # 1MB max content
     ):
-        """
-        Initialize HTML loader.
-
-        Args:
-            timeout: Maximum time in seconds for loading operations
-            max_file_size_mb: Maximum file size in MB
-            max_memory_mb: Maximum memory usage in MB
-            chunk_size: Chunk size for streaming reads
-            extract_tables: Whether to extract tables from HTML
-            extract_links: Whether to extract links
-            extract_metadata: Whether to extract metadata
-            preserve_structure: Whether to preserve HTML structure in text
-            clean_content: Whether to clean content (remove scripts, styles, etc.)
-            max_content_length: Maximum content length to extract
-        """
         super().__init__(timeout, max_file_size_mb, max_memory_mb, chunk_size)
         self.extract_tables = extract_tables
         self.extract_links = extract_links
@@ -303,14 +691,12 @@ class HTMLLoader(BaseLoader):
         self.clean_content = clean_content
         self.max_content_length = max_content_length
 
-        # Elements to remove during cleaning
         self.remove_elements = [
             'script', 'style', 'nav', 'footer', 'header',
             'aside', 'form', 'input', 'button', 'noscript',
             'iframe', 'embed', 'object', 'applet'
         ]
 
-        # Elements to treat as structure
         self.structure_tags = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'div', 'section', 'article']
 
         logger.info(f"HTMLLoader initialized: extract_tables={extract_tables}, "
@@ -318,15 +704,7 @@ class HTMLLoader(BaseLoader):
 
     @handle_loader_errors()
     def load(self, file_path: str) -> LoaderResult:
-        """
-        Load and parse HTML document.
-
-        Args:
-            file_path: Path to HTML file
-
-        Returns:
-            LoaderResult with content and metadata
-        """
+        """Load and parse HTML document."""
         is_valid, error_code, error_msg = self.validate_file(file_path)
         if not is_valid:
             return LoaderResult(
@@ -341,42 +719,33 @@ class HTMLLoader(BaseLoader):
         file_size = Path(file_path).stat().st_size
 
         try:
-            # Detect encoding
             encoding = self._detect_encoding(file_path)
             metadata["detected_encoding"] = encoding
 
-            # Read HTML content
             with track_memory("HTML reading"):
                 with open(file_path, 'r', encoding=encoding) as f:
                     html_content = f.read()
 
-            # Parse HTML
             with track_memory("HTML parsing"):
                 soup = BeautifulSoup(html_content, 'html.parser')
 
-            # Extract metadata
             if self.extract_metadata:
                 self._extract_metadata_from_soup(soup, metadata)
 
-            # Clean content
             if self.clean_content:
                 self._clean_soup(soup)
 
-            # Extract content
             content_parts = []
 
-            # Extract title
             if soup.title and soup.title.string:
                 title = soup.title.string.strip()
                 if title:
                     content_parts.append(f"Title: {title}")
 
-            # Extract main content
             main_content = self._extract_main_content(soup)
             if main_content:
                 content_parts.append(main_content)
 
-            # Extract tables
             if self.extract_tables:
                 tables = self._extract_tables(soup)
                 if tables:
@@ -384,7 +753,6 @@ class HTMLLoader(BaseLoader):
                     content_parts.extend(tables)
                     metadata["num_tables"] = len(tables)
 
-            # Extract links
             if self.extract_links:
                 links = self._extract_links(soup)
                 if links:
@@ -395,15 +763,12 @@ class HTMLLoader(BaseLoader):
             if not content_parts:
                 raise ParsingError("No content extracted from HTML")
 
-            # Join content
             content = "\n\n".join(content_parts)
 
-            # Limit content length if needed
             if len(content) > self.max_content_length:
                 content = content[:self.max_content_length]
                 warnings.append(f"Content truncated to {self.max_content_length} characters")
 
-            # Clean up soup to free memory
             soup.decompose()
             del soup
             gc.collect()
@@ -429,7 +794,6 @@ class HTMLLoader(BaseLoader):
                 result = chardet.detect(raw_data)
                 detected = result.get('encoding', 'utf-8')
 
-                # Check for HTML meta charset
                 try:
                     content = raw_data.decode(detected, errors='ignore')
                     meta_match = re.search(r'<meta[^>]*charset=["\']?([^"\' />]+)', content, re.IGNORECASE)
@@ -444,24 +808,19 @@ class HTMLLoader(BaseLoader):
 
     def _clean_soup(self, soup: BeautifulSoup):
         """Clean HTML soup by removing unwanted elements."""
-        # Remove unwanted elements
         for element in self.remove_elements:
             for tag in soup.find_all(element):
                 tag.decompose()
 
-        # Remove comments
         for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
             comment.extract()
 
-        # Remove empty tags
         for tag in soup.find_all():
             if not tag.get_text(strip=True) and not tag.find_all():
                 tag.decompose()
 
-        # Remove unwanted attributes
         for tag in soup.find_all():
             if tag.attrs:
-                # Keep only useful attributes
                 allowed_attrs = ['class', 'id', 'href', 'src', 'alt', 'title']
                 for attr in list(tag.attrs.keys()):
                     if attr not in allowed_attrs:
@@ -469,14 +828,11 @@ class HTMLLoader(BaseLoader):
 
     def _extract_metadata_from_soup(self, soup: BeautifulSoup, metadata: Dict[str, Any]):
         """Extract metadata from BeautifulSoup object."""
-        # Basic metadata
         if soup.title and soup.title.string:
             metadata["title"] = soup.title.string.strip()
 
-        # Meta tags
         meta_tags = {}
 
-        # Standard meta tags
         for meta in soup.find_all('meta'):
             name = meta.get('name', '').lower()
             property_name = meta.get('property', '').lower()
@@ -490,7 +846,6 @@ class HTMLLoader(BaseLoader):
             elif property_name:
                 meta_tags[f"meta_{property_name}"] = content
 
-            # Common meta tags
             if name == 'description':
                 metadata["description"] = content
             elif name == 'keywords':
@@ -500,7 +855,6 @@ class HTMLLoader(BaseLoader):
             elif name == 'robots':
                 metadata["robots"] = content
 
-        # Open Graph metadata
         og_tags = {}
         for meta in soup.find_all('meta', property=re.compile(r'^og:')):
             property_name = meta.get('property', '')
@@ -511,7 +865,6 @@ class HTMLLoader(BaseLoader):
         if og_tags:
             metadata["open_graph"] = og_tags
 
-        # JSON-LD
         json_ld = []
         for script in soup.find_all('script', type='application/ld+json'):
             try:
@@ -523,7 +876,6 @@ class HTMLLoader(BaseLoader):
         if json_ld:
             metadata["json_ld"] = json_ld
 
-        # Headings
         headings = {}
         for level in range(1, 7):
             tags = soup.find_all(f'h{level}')
@@ -532,11 +884,9 @@ class HTMLLoader(BaseLoader):
         if headings:
             metadata["headings"] = headings
 
-        # Links
         links = soup.find_all('a')
         if links:
             metadata["total_links"] = len(links)
-            # Get unique domains
             domains = set()
             for link in links:
                 href = link.get('href', '')
@@ -550,20 +900,14 @@ class HTMLLoader(BaseLoader):
             if domains:
                 metadata["linked_domains"] = list(domains)[:20]
 
-        # Images
         images = soup.find_all('img')
         if images:
             metadata["total_images"] = len(images)
-            # Count images with alt text
             alt_count = sum(1 for img in images if img.get('alt'))
             metadata["images_with_alt"] = alt_count
 
     def _extract_main_content(self, soup: BeautifulSoup) -> Optional[str]:
-        """
-        Extract main content from HTML.
-        Uses heuristic to find main content area.
-        """
-        # Try to find main content area
+        """Extract main content from HTML."""
         main_selectors = [
             'main',
             'article',
@@ -583,23 +927,18 @@ class HTMLLoader(BaseLoader):
                 content = elements[0]
                 break
 
-        # If no main content area found, use body
         if content is None:
             content = soup.body if soup.body else soup
 
-        # Extract text while preserving some structure
         if self.preserve_structure:
             return self._extract_structured_text(content)
         else:
             return content.get_text(separator=' ', strip=True)
 
     def _extract_structured_text(self, element) -> str:
-        """
-        Extract text while preserving some HTML structure (headings, paragraphs).
-        """
+        """Extract text while preserving some HTML structure."""
         parts = []
 
-        # Process children
         for child in element.children:
             if isinstance(child, NavigableString):
                 text = str(child).strip()
@@ -608,20 +947,17 @@ class HTMLLoader(BaseLoader):
             elif hasattr(child, 'name'):
                 tag_name = child.name
 
-                # Headings
                 if tag_name and tag_name.startswith('h'):
                     text = child.get_text(strip=True)
                     if text:
                         level = int(tag_name[1]) if tag_name[1:].isdigit() else 1
                         parts.append(f"\n{'#' * level} {text}\n")
 
-                # Paragraphs
                 elif tag_name == 'p':
                     text = child.get_text(strip=True)
                     if text:
                         parts.append(text)
 
-                # Lists
                 elif tag_name in ['ul', 'ol']:
                     list_items = []
                     for li in child.find_all('li', recursive=False):
@@ -634,19 +970,16 @@ class HTMLLoader(BaseLoader):
                     if list_items:
                         parts.append("\n".join(list_items))
 
-                # Blockquotes
                 elif tag_name == 'blockquote':
                     text = child.get_text(strip=True)
                     if text:
                         parts.append(f"\n> {text}\n")
 
-                # Other block elements
                 elif tag_name in ['div', 'section', 'article', 'aside']:
                     inner_text = self._extract_structured_text(child)
                     if inner_text:
                         parts.append(inner_text)
 
-                # Inline elements
                 elif tag_name in ['span', 'strong', 'em', 'b', 'i', 'a']:
                     text = child.get_text(strip=True)
                     if text:
@@ -655,12 +988,7 @@ class HTMLLoader(BaseLoader):
         return '\n\n'.join(parts)
 
     def _extract_tables(self, soup: BeautifulSoup) -> List[str]:
-        """
-        Extract tables from HTML.
-
-        Returns:
-            List of formatted table strings
-        """
+        """Extract tables from HTML."""
         tables = []
         table_tags = soup.find_all('table')
 
@@ -668,12 +996,10 @@ class HTMLLoader(BaseLoader):
             table_lines = []
             table_lines.append(f"Table {table_idx}:")
 
-            # Extract rows
             rows = table.find_all('tr')
             if not rows:
                 continue
 
-            # Extract headers
             headers = []
             header_row = rows[0]
             for th in header_row.find_all(['th', 'td']):
@@ -683,7 +1009,6 @@ class HTMLLoader(BaseLoader):
                 table_lines.append("  " + " | ".join(headers))
                 table_lines.append("  " + "-" * (sum(len(h) for h in headers) + len(headers) * 3))
 
-            # Extract data rows
             for row_idx, row in enumerate(rows[1:], 1):
                 cells = []
                 for td in row.find_all(['td', 'th']):
@@ -697,12 +1022,7 @@ class HTMLLoader(BaseLoader):
         return tables
 
     def _extract_links(self, soup: BeautifulSoup) -> List[str]:
-        """
-        Extract links from HTML.
-
-        Returns:
-            List of formatted link strings
-        """
+        """Extract links from HTML."""
         links = []
         seen_urls = set()
 
@@ -715,17 +1035,14 @@ class HTMLLoader(BaseLoader):
 
             seen_urls.add(href)
 
-            # Truncate very long URLs
             if len(href) > 200:
                 href = href[:197] + "..."
 
-            # Add context
             if text:
                 links.append(f"  {text}: {href}")
             else:
                 links.append(f"  {href}")
 
-            # Limit number of links
             if len(links) >= 100:
                 links.append("  ... and more links")
                 break
@@ -753,23 +1070,20 @@ class HTMLLoader(BaseLoader):
         }
 
         try:
-            # Get basic file info
             path = Path(file_path)
             metadata["file_size"] = path.stat().st_size
             metadata["file_name"] = path.name
 
-            # Try to extract metadata quickly
             try:
                 encoding = self._detect_encoding(file_path)
                 metadata["encoding"] = encoding
 
                 with open(file_path, 'r', encoding=encoding) as f:
-                    content = f.read(50000)  # Read first 50KB for metadata
+                    content = f.read(50000)
 
                 soup = BeautifulSoup(content, 'html.parser')
                 self._extract_metadata_from_soup(soup, metadata)
 
-                # Clean up
                 soup.decompose()
                 del soup
                 gc.collect()
@@ -817,7 +1131,8 @@ class DocumentLoader:
                  extract_headers: bool = True, preserve_formatting: bool = True,
                  extract_lists: bool = True, max_paragraphs: int = 100000,
                  extract_links: bool = True, extract_metadata: bool = True,
-                 clean_html: bool = True, preserve_html_structure: bool = True):
+                 clean_html: bool = True, preserve_html_structure: bool = True,
+                 auto_detect_delimiter: bool = True, max_csv_rows: int = 100000):
         """
         Initialize document loader.
 
@@ -825,7 +1140,7 @@ class DocumentLoader:
             timeout: Maximum time in seconds for loading operations
             max_file_size_mb: Maximum file size in MB
             max_memory_mb: Maximum memory usage in MB
-            extract_tables: Whether to extract tables from DOCX/HTML
+            extract_tables: Whether to extract tables from DOCX/HTML/CSV
             extract_headers: Whether to extract headers/footers
             preserve_formatting: Whether to preserve formatting
             extract_lists: Whether to detect and format lists
@@ -834,6 +1149,8 @@ class DocumentLoader:
             extract_metadata: Whether to extract metadata from HTML
             clean_html: Whether to clean HTML content
             preserve_html_structure: Whether to preserve HTML structure
+            auto_detect_delimiter: Whether to auto-detect CSV delimiter
+            max_csv_rows: Maximum rows to process from CSV
         """
         self.timeout = timeout
         self.max_file_size_mb = max_file_size_mb
@@ -890,10 +1207,14 @@ class DocumentLoader:
                 max_file_size_mb=max_file_size_mb,
                 max_memory_mb=max_memory_mb
             ),
-            '.csv': TextLoader(
+            '.csv': CSVLoader(
                 timeout=timeout,
                 max_file_size_mb=max_file_size_mb,
-                max_memory_mb=max_memory_mb
+                max_memory_mb=max_memory_mb,
+                auto_detect_delimiter=auto_detect_delimiter,
+                max_rows=max_csv_rows,
+                include_headers=True,
+                infer_column_types=True
             ),
             '.json': TextLoader(
                 timeout=timeout,
@@ -1010,20 +1331,18 @@ class DocumentLoader:
 
 
 if __name__ == "__main__":
-    # Example usage with HTML
+    # Example usage with CSV
     logging.basicConfig(level=logging.INFO)
 
     loader = DocumentLoader(
         extract_tables=True,
-        extract_links=True,
-        extract_metadata=True,
-        clean_html=True,
-        preserve_html_structure=True
+        auto_detect_delimiter=True,
+        max_csv_rows=10000
     )
 
-    # Load an HTML file
-    # result = loader.load_document("sample.html")
+    # Load a CSV file
+    # result = loader.load_document("sample.csv")
     # print(f"Content length: {len(result['content'])}")
     # print(f"Metadata: {result['metadata']}")
 
-    print("HTML Loader ready with enhanced features")
+    print("CSV Loader ready with enhanced features")

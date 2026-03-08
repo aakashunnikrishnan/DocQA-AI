@@ -1,6 +1,6 @@
 """
 OpenAI embeddings integration for generating vector representations of text chunks.
-ENHANCED: Batch processing, rate limiting, async support, and caching for large-scale ingestion.
+OPTIMIZED: Advanced batching with dynamic batch sizing, throughput optimization, and caching.
 """
 
 import os
@@ -8,13 +8,15 @@ import logging
 import time
 import asyncio
 import hashlib
-from typing import List, Dict, Any, Optional, Union, Tuple, Iterator
+from typing import List, Dict, Any, Optional, Union, Tuple, Iterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 from collections import deque
 import threading
+import math
+from functools import wraps
 
 from tenacity import (
     retry,
@@ -69,271 +71,449 @@ class EmbeddingResult:
         return np.array(self.embedding, dtype=np.float32)
 
 
-class RateLimiter:
+class BatchOptimizer:
     """
-    Rate limiter for API calls with token bucket algorithm.
+    Dynamic batch optimizer for embedding generation.
+    Adjusts batch size based on token usage, latency, and success rates.
     """
 
-    def __init__(self, requests_per_minute: int = 50, tokens_per_minute: int = 100000):
+    def __init__(
+        self,
+        initial_batch_size: int = 20,
+        min_batch_size: int = 5,
+        max_batch_size: int = 100,
+        target_tokens_per_batch: int = 8000,
+        adjustment_factor: float = 0.1,
+        cooldown_seconds: int = 60
+    ):
         """
-        Initialize rate limiter.
+        Initialize batch optimizer.
 
         Args:
-            requests_per_minute: Maximum requests per minute
-            tokens_per_minute: Maximum tokens per minute
+            initial_batch_size: Starting batch size
+            min_batch_size: Minimum batch size
+            max_batch_size: Maximum batch size
+            target_tokens_per_batch: Target tokens per batch
+            adjustment_factor: Factor for batch size adjustments
+            cooldown_seconds: Cooldown between adjustments
         """
-        self.requests_per_minute = requests_per_minute
-        self.tokens_per_minute = tokens_per_minute
+        self.current_batch_size = initial_batch_size
+        self.min_batch_size = min_batch_size
+        self.max_batch_size = max_batch_size
+        self.target_tokens_per_batch = target_tokens_per_batch
+        self.adjustment_factor = adjustment_factor
+        self.cooldown_seconds = cooldown_seconds
 
-        self.request_interval = 60.0 / requests_per_minute
-        self.token_interval = 60.0 / tokens_per_minute if tokens_per_minute > 0 else 0
+        # Statistics
+        self.batch_stats = {
+            "total_batches": 0,
+            "successful_batches": 0,
+            "failed_batches": 0,
+            "avg_tokens_per_batch": 0,
+            "avg_latency_ms": 0,
+            "batch_sizes": [],
+            "token_counts": [],
+            "latencies": []
+        }
 
-        self.request_timestamps = deque(maxlen=requests_per_minute)
-        self.token_timestamps = deque(maxlen=tokens_per_minute)
-
+        self._last_adjustment_time = 0
         self._lock = threading.Lock()
 
-        logger.info(f"RateLimiter initialized: {requests_per_minute} req/min, {tokens_per_minute} tokens/min")
+        logger.info(f"BatchOptimizer initialized: initial={initial_batch_size}, "
+                   f"min={min_batch_size}, max={max_batch_size}")
 
-    def wait(self, tokens: int = 0):
+    def record_batch_result(
+        self,
+        batch_size: int,
+        tokens_used: int,
+        latency_ms: float,
+        success: bool
+    ):
         """
-        Wait until rate limit allows request.
+        Record batch performance statistics.
 
         Args:
-            tokens: Number of tokens for this request
+            batch_size: Number of items in batch
+            tokens_used: Total tokens in batch
+            latency_ms: Batch processing time
+            success: Whether batch was successful
         """
         with self._lock:
-            now = time.time()
+            self.batch_stats["total_batches"] += 1
+            self.batch_stats["batch_sizes"].append(batch_size)
+            self.batch_stats["token_counts"].append(tokens_used)
+            self.batch_stats["latencies"].append(latency_ms)
 
-            # Check request rate
-            if len(self.request_timestamps) >= self.requests_per_minute:
-                oldest = self.request_timestamps[0]
-                wait_time = self.request_interval - (now - oldest)
-                if wait_time > 0:
-                    time.sleep(wait_time)
-                    now = time.time()
+            if success:
+                self.batch_stats["successful_batches"] += 1
+            else:
+                self.batch_stats["failed_batches"] += 1
 
-            # Check token rate
-            if tokens > 0 and self.tokens_per_minute > 0:
-                if len(self.token_timestamps) >= self.tokens_per_minute:
-                    oldest = self.token_timestamps[0]
-                    wait_time = self.token_interval - (now - oldest)
-                    if wait_time > 0:
-                        time.sleep(wait_time)
-                        now = time.time()
+            # Update averages
+            self.batch_stats["avg_tokens_per_batch"] = np.mean(self.batch_stats["token_counts"])
+            self.batch_stats["avg_latency_ms"] = np.mean(self.batch_stats["latencies"])
 
-            # Record request
-            self.request_timestamps.append(now)
-            if tokens > 0:
-                for _ in range(tokens):
-                    self.token_timestamps.append(now)
-
-    async def wait_async(self, tokens: int = 0):
+    def get_optimal_batch_size(self, estimated_tokens: int = 0) -> int:
         """
-        Async version of wait.
+        Get optimal batch size based on current performance.
 
         Args:
-            tokens: Number of tokens for this request
+            estimated_tokens: Estimated tokens for current batch
+
+        Returns:
+            Optimal batch size
         """
         with self._lock:
-            now = time.time()
+            # Check if enough data for optimization
+            if self.batch_stats["total_batches"] < 5:
+                return self.current_batch_size
 
-            if len(self.request_timestamps) >= self.requests_per_minute:
-                oldest = self.request_timestamps[0]
-                wait_time = self.request_interval - (now - oldest)
-                if wait_time > 0:
-                    await asyncio.sleep(wait_time)
-                    now = time.time()
+            current_time = time.time()
+            if current_time - self._last_adjustment_time < self.cooldown_seconds:
+                return self.current_batch_size
 
-            if tokens > 0 and self.tokens_per_minute > 0:
-                if len(self.token_timestamps) >= self.tokens_per_minute:
-                    oldest = self.token_timestamps[0]
-                    wait_time = self.token_interval - (now - oldest)
-                    if wait_time > 0:
-                        await asyncio.sleep(wait_time)
-                        now = time.time()
+            # Calculate optimal size based on token targets
+            if estimated_tokens > 0:
+                # Adjust based on token estimate
+                target_size = int(self.target_tokens_per_batch / estimated_tokens) * 2
+                target_size = max(self.min_batch_size, min(self.max_batch_size, target_size))
+            else:
+                # Use historical data
+                token_ratio = self.target_tokens_per_batch / max(1, self.batch_stats["avg_tokens_per_batch"])
+                target_size = int(self.current_batch_size * token_ratio)
 
-            self.request_timestamps.append(now)
-            if tokens > 0:
-                for _ in range(tokens):
-                    self.token_timestamps.append(now)
+            # Apply adjustment factor
+            adjustment = (target_size - self.current_batch_size) * self.adjustment_factor
+            new_size = int(self.current_batch_size + adjustment)
+
+            # Clamp to limits
+            new_size = max(self.min_batch_size, min(self.max_batch_size, new_size))
+
+            # Check latency-based adjustment
+            if self.batch_stats["avg_latency_ms"] > 5000:  # >5 seconds
+                # Reduce batch size if latency is high
+                new_size = max(self.min_batch_size, int(new_size * 0.8))
+
+            # Update if changed significantly
+            if abs(new_size - self.current_batch_size) > 2:
+                self.current_batch_size = new_size
+                self._last_adjustment_time = current_time
+                logger.info(f"Adjusted batch size to {new_size} (was {self.current_batch_size})")
+
+            return self.current_batch_size
 
     def get_stats(self) -> Dict[str, Any]:
-        """Get rate limiter statistics."""
+        """Get batch optimizer statistics."""
         with self._lock:
+            total = self.batch_stats["total_batches"]
+            if total == 0:
+                success_rate = 0.0
+            else:
+                success_rate = self.batch_stats["successful_batches"] / total
+
             return {
-                "requests_per_minute": self.requests_per_minute,
-                "tokens_per_minute": self.tokens_per_minute,
-                "current_requests": len(self.request_timestamps),
-                "current_tokens": len(self.token_timestamps),
-                "request_interval": self.request_interval,
-                "token_interval": self.token_interval
+                "current_batch_size": self.current_batch_size,
+                "min_batch_size": self.min_batch_size,
+                "max_batch_size": self.max_batch_size,
+                "total_batches": total,
+                "successful_batches": self.batch_stats["successful_batches"],
+                "failed_batches": self.batch_stats["failed_batches"],
+                "success_rate": success_rate,
+                "avg_tokens_per_batch": self.batch_stats["avg_tokens_per_batch"],
+                "avg_latency_ms": self.batch_stats["avg_latency_ms"],
+                "target_tokens_per_batch": self.target_tokens_per_batch
             }
 
 
-class EmbeddingCache:
+class AdaptiveBatchProcessor:
     """
-    Persistent cache for embeddings to avoid redundant API calls.
-    Supports disk persistence with LRU eviction.
+    Adaptive batch processor for efficient embedding generation.
+    Handles dynamic batching, parallel processing, and throughput optimization.
     """
 
-    def __init__(self, cache_dir: str = "./data/embeddings/cache", max_size: int = 10000):
+    def __init__(
+        self,
+        client: Any,
+        model: str,
+        dimension: int,
+        batch_optimizer: Optional[BatchOptimizer] = None,
+        max_workers: int = 4,
+        use_parallel: bool = True,
+        timeout: int = 60
+    ):
         """
-        Initialize embedding cache.
+        Initialize adaptive batch processor.
 
         Args:
-            cache_dir: Directory for cache storage
-            max_size: Maximum number of entries in cache
+            client: OpenAI client
+            model: Model name
+            dimension: Embedding dimension
+            batch_optimizer: Batch optimizer instance
+            max_workers: Maximum parallel workers
+            use_parallel: Whether to use parallel processing
+            timeout: Request timeout
         """
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.max_size = max_size
-        self._cache: Dict[str, EmbeddingResult] = {}
-        self._access_order: List[str] = []
-        self._lock = threading.Lock()
-        self._load_cache()
+        self.client = client
+        self.model = model
+        self.dimension = dimension
+        self.batch_optimizer = batch_optimizer or BatchOptimizer()
+        self.max_workers = max_workers
+        self.use_parallel = use_parallel
+        self.timeout = timeout
 
-        logger.info(f"EmbeddingCache initialized: {cache_dir}, max_size={max_size}")
+        self._executor = ThreadPoolExecutor(max_workers=max_workers) if use_parallel else None
 
-    def _get_hash_key(self, text: str, model: str) -> str:
-        """Generate hash key for text and model combination."""
-        content = f"{text}:{model}".encode('utf-8')
-        return hashlib.md5(content).hexdigest()
+        # Rate limiting
+        self._rate_limiter = None
 
-    def _get_cache_file(self) -> Path:
-        """Get cache file path."""
-        return self.cache_dir / "embeddings_cache.npz"
+        logger.info(f"AdaptiveBatchProcessor initialized: max_workers={max_workers}, "
+                   f"use_parallel={use_parallel}")
 
-    def _load_cache(self):
-        """Load cached embeddings from disk."""
-        cache_file = self._get_cache_file()
-        if cache_file.exists():
-            try:
-                data = np.load(cache_file, allow_pickle=True)
-                keys = data['keys']
-                # Load embeddings as list of lists
-                embeddings_data = data['embeddings']
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((RateLimitError, APIError, APIConnectionError)),
+        before_sleep=before_sleep_log(logger, logging.WARNING)
+    )
+    def _process_batch_sync(
+        self,
+        texts: List[str],
+        batch_id: str
+    ) -> Tuple[List[List[float]], int]:
+        """
+        Process a single batch synchronously.
 
-                for key, emb_data in zip(keys, embeddings_data):
-                    # Reconstruct EmbeddingResult
-                    if isinstance(emb_data, dict):
-                        result = EmbeddingResult(
-                            text=emb_data.get('text', ''),
-                            embedding=emb_data.get('embedding', []),
-                            metadata=emb_data.get('metadata', {}),
-                            model=emb_data.get('model', ''),
-                            tokens_used=emb_data.get('tokens_used', 0)
-                        )
-                        self._cache[key] = result
-                        self._access_order.append(key)
+        Args:
+            texts: List of texts to embed
+            batch_id: Batch identifier
 
-                logger.info(f"Loaded {len(self._cache)} cached embeddings from {cache_file}")
-            except Exception as e:
-                logger.warning(f"Failed to load cache: {e}")
-                self._cache = {}
-                self._access_order = []
+        Returns:
+            Tuple of (embeddings, total_tokens)
+        """
+        start_time = time.time()
 
-    def _save_cache(self):
-        """Save cached embeddings to disk."""
-        if not self._cache:
-            return
-
-        cache_file = self._get_cache_file()
         try:
-            keys = list(self._cache.keys())
-            # Convert embeddings to serializable format
-            embeddings_data = []
-            for key in keys:
-                result = self._cache[key]
-                embeddings_data.append({
-                    'text': result.text,
-                    'embedding': result.embedding,
-                    'metadata': result.metadata,
-                    'model': result.model,
-                    'tokens_used': result.tokens_used
-                })
-
-            np.savez_compressed(
-                cache_file,
-                keys=np.array(keys),
-                embeddings=np.array(embeddings_data, dtype=object)
+            response: CreateEmbeddingResponse = self.client.embeddings.create(
+                model=self.model,
+                input=texts,
+                dimensions=self.dimension
             )
-            logger.debug(f"Saved {len(self._cache)} embeddings to cache")
+
+            embeddings = [data.embedding for data in response.data]
+            total_tokens = response.usage.total_tokens
+
+            latency_ms = (time.time() - start_time) * 1000
+
+            # Record batch performance
+            self.batch_optimizer.record_batch_result(
+                batch_size=len(texts),
+                tokens_used=total_tokens,
+                latency_ms=latency_ms,
+                success=True
+            )
+
+            logger.debug(f"Batch {batch_id}: {len(texts)} texts, {total_tokens} tokens, "
+                        f"{latency_ms:.0f}ms")
+
+            return embeddings, total_tokens
+
         except Exception as e:
-            logger.warning(f"Failed to save cache: {e}")
+            # Record failure
+            latency_ms = (time.time() - start_time) * 1000
+            self.batch_optimizer.record_batch_result(
+                batch_size=len(texts),
+                tokens_used=0,
+                latency_ms=latency_ms,
+                success=False
+            )
+            raise
 
-    def get(self, text: str, model: str) -> Optional[EmbeddingResult]:
-        """Get cached embedding if available."""
-        with self._lock:
-            key = self._get_hash_key(text, model)
-            if key in self._cache:
-                # Update access order (move to end)
-                if key in self._access_order:
-                    self._access_order.remove(key)
-                self._access_order.append(key)
-                return self._cache[key]
-            return None
+    def _process_batch_parallel(
+        self,
+        batches: List[Tuple[List[str], str]]
+    ) -> List[Tuple[List[List[float]], int]]:
+        """
+        Process multiple batches in parallel.
 
-    def set(self, text: str, model: str, result: EmbeddingResult):
-        """Cache an embedding result."""
-        with self._lock:
-            key = self._get_hash_key(text, model)
+        Args:
+            batches: List of (texts, batch_id) tuples
 
-            # Evict if at max size
-            if len(self._cache) >= self.max_size and key not in self._cache:
-                # Remove least recently used
-                if self._access_order:
-                    oldest_key = self._access_order.pop(0)
-                    if oldest_key in self._cache:
-                        del self._cache[oldest_key]
+        Returns:
+            List of (embeddings, total_tokens) tuples
+        """
+        if not self._executor:
+            return [self._process_batch_sync(texts, batch_id) for texts, batch_id in batches]
 
-            self._cache[key] = result
-            if key in self._access_order:
-                self._access_order.remove(key)
-            self._access_order.append(key)
+        futures = []
+        for texts, batch_id in batches:
+            future = self._executor.submit(self._process_batch_sync, texts, batch_id)
+            futures.append(future)
 
-            # Periodically save cache (every 100 items)
-            if len(self._cache) % 100 == 0:
-                self._save_cache()
+        results = []
+        for future in as_completed(futures):
+            try:
+                result = future.result(timeout=self.timeout)
+                results.append(result)
+            except Exception as e:
+                logger.error(f"Parallel batch processing failed: {e}")
+                # Return zero embeddings for failed batch
+                results.append(([[0.0] * self.dimension] * len(batches[0][0]), 0))
 
-    def set_batch(self, texts: List[str], model: str, results: List[EmbeddingResult]):
-        """Cache multiple embeddings at once."""
-        with self._lock:
-            for text, result in zip(texts, results):
-                key = self._get_hash_key(text, model)
-                self._cache[key] = result
-                if key in self._access_order:
-                    self._access_order.remove(key)
-                self._access_order.append(key)
+        return results
 
-            # Save if cache size changed significantly
-            if len(self._cache) % 100 < len(results):
-                self._save_cache()
+    def process(
+        self,
+        texts: List[str],
+        show_progress: bool = True
+    ) -> Tuple[List[List[float]], int, List[str]]:
+        """
+        Process texts with adaptive batching.
 
-    def clear(self):
-        """Clear the cache."""
-        with self._lock:
-            self._cache.clear()
-            self._access_order = []
-            cache_file = self._get_cache_file()
-            if cache_file.exists():
-                cache_file.unlink()
-            logger.info("Cache cleared")
+        Args:
+            texts: List of texts to embed
+            show_progress: Whether to show progress
 
-    def get_stats(self) -> Dict[str, Any]:
-        """Get cache statistics."""
-        with self._lock:
-            return {
-                "size": len(self._cache),
-                "max_size": self.max_size,
-                "cache_dir": str(self.cache_dir),
-                "usage_percent": (len(self._cache) / self.max_size * 100) if self.max_size > 0 else 0
-            }
+        Returns:
+            Tuple of (embeddings, total_tokens, batch_ids)
+        """
+        if not texts:
+            return [], 0, []
+
+        # Estimate tokens for batch optimization
+        estimated_tokens = sum(len(t) // 4 for t in texts)  # Rough estimate
+
+        # Get optimal batch size
+        batch_size = self.batch_optimizer.get_optimal_batch_size(
+            estimated_tokens // max(1, len(texts))
+        )
+
+        # Create batches
+        batches = []
+        batch_ids = []
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i:i + batch_size]
+            batch_id = f"batch_{len(batches)}"
+            batches.append((batch_texts, batch_id))
+            batch_ids.append(batch_id)
+
+        logger.info(f"Processing {len(texts)} texts in {len(batches)} batches "
+                   f"(batch_size={batch_size})")
+
+        # Process batches
+        all_embeddings = []
+        total_tokens = 0
+
+        if self.use_parallel and len(batches) > 1:
+            # Parallel processing
+            results = self._process_batch_parallel(batches)
+            for embeddings, tokens in results:
+                all_embeddings.extend(embeddings)
+                total_tokens += tokens
+        else:
+            # Sequential processing
+            for batch_texts, batch_id in batches:
+                embeddings, tokens = self._process_batch_sync(batch_texts, batch_id)
+                all_embeddings.extend(embeddings)
+                total_tokens += tokens
+
+        return all_embeddings, total_tokens, batch_ids
 
 
-class BatchEmbeddingGenerator:
+class SmartBatchGenerator:
     """
-    Optimized batch embedding generator with rate limiting, caching, and retry logic.
+    Smart batch generator that groups texts by estimated token count.
+    Optimizes batch composition for better API utilization.
+    """
+
+    def __init__(
+        self,
+        max_tokens_per_batch: int = 8000,
+        max_texts_per_batch: int = 100,
+        min_texts_per_batch: int = 1
+    ):
+        """
+        Initialize smart batch generator.
+
+        Args:
+            max_tokens_per_batch: Maximum tokens per batch
+            max_texts_per_batch: Maximum texts per batch
+            min_texts_per_batch: Minimum texts per batch
+        """
+        self.max_tokens_per_batch = max_tokens_per_batch
+        self.max_texts_per_batch = max_texts_per_batch
+        self.min_texts_per_batch = min_texts_per_batch
+
+        logger.info(f"SmartBatchGenerator initialized: max_tokens={max_tokens_per_batch}, "
+                   f"max_texts={max_texts_per_batch}")
+
+    def estimate_tokens(self, text: str) -> int:
+        """Estimate tokens in a text."""
+        return len(text) // 4  # Rough estimate (1 token ≈ 4 chars)
+
+    def generate_batches(
+        self,
+        texts: List[str],
+        token_estimates: Optional[List[int]] = None
+    ) -> List[List[str]]:
+        """
+        Generate optimized batches.
+
+        Args:
+            texts: List of texts
+            token_estimates: Optional pre-computed token estimates
+
+        Returns:
+            List of batches
+        """
+        if not texts:
+            return []
+
+        # Get token estimates
+        if token_estimates is None:
+            token_estimates = [self.estimate_tokens(t) for t in texts]
+
+        # Pair texts with their estimates
+        items = list(zip(texts, token_estimates))
+
+        # Sort by token count (larger texts first)
+        items.sort(key=lambda x: x[1], reverse=True)
+
+        batches = []
+        current_batch = []
+        current_tokens = 0
+
+        for text, tokens in items:
+            # Check if adding this text would exceed limits
+            if (current_tokens + tokens > self.max_tokens_per_batch or
+                len(current_batch) >= self.max_texts_per_batch):
+
+                if current_batch:
+                    batches.append(current_batch)
+                    current_batch = []
+                    current_tokens = 0
+
+            current_batch.append(text)
+            current_tokens += tokens
+
+        # Add last batch
+        if current_batch:
+            batches.append(current_batch)
+
+        # Ensure minimum batch size (merge small batches)
+        merged_batches = []
+        for batch in batches:
+            if len(batch) < self.min_texts_per_batch and merged_batches:
+                # Merge with previous batch
+                merged_batches[-1].extend(batch)
+            else:
+                merged_batches.append(batch)
+
+        return merged_batches
+
+
+class OptimizedEmbeddingGenerator:
+    """
+    Optimized embedding generator with advanced batching, caching, and performance tuning.
     """
 
     def __init__(
@@ -351,19 +531,23 @@ class BatchEmbeddingGenerator:
         use_cache: bool = True,
         cache_dir: str = "./data/embeddings/cache",
         max_cache_size: int = 10000,
-        show_progress: bool = True
+        show_progress: bool = True,
+        use_adaptive_batching: bool = True,
+        max_workers: int = 4,
+        use_parallel: bool = True,
+        smart_batching: bool = True
     ):
         """
-        Initialize batch embedding generator.
+        Initialize optimized embedding generator.
 
         Args:
             model: OpenAI embedding model name
             api_key: OpenAI API key
             base_url: Custom API base URL
-            batch_size: Number of texts to embed in one batch
-            max_retries: Maximum number of retries for failed requests
+            batch_size: Initial batch size
+            max_retries: Maximum number of retries
             timeout: Request timeout in seconds
-            dimensions: Output dimensions (for 3-small/3-large models)
+            dimensions: Output dimensions
             organization: OpenAI organization ID
             rate_limit_requests: Maximum requests per minute
             rate_limit_tokens: Maximum tokens per minute
@@ -371,6 +555,10 @@ class BatchEmbeddingGenerator:
             cache_dir: Directory for cache storage
             max_cache_size: Maximum cache entries
             show_progress: Whether to show progress bar
+            use_adaptive_batching: Whether to use adaptive batching
+            max_workers: Maximum parallel workers
+            use_parallel: Whether to use parallel processing
+            smart_batching: Whether to use smart batching
         """
         if not OPENAI_AVAILABLE:
             raise ImportError(
@@ -378,13 +566,16 @@ class BatchEmbeddingGenerator:
             )
 
         self.model = model
-        self.batch_size = batch_size
         self.max_retries = max_retries
         self.timeout = timeout
         self.show_progress = show_progress
+        self.use_adaptive_batching = use_adaptive_batching
+        self.use_parallel = use_parallel
+        self.smart_batching = smart_batching
 
         # Model configuration
         self.model_config = self._get_model_config(model, dimensions)
+        self.dimension = self.model_config["dimension"]
 
         # Initialize clients
         api_key = api_key or os.getenv("OPENAI_API_KEY")
@@ -408,34 +599,58 @@ class BatchEmbeddingGenerator:
             timeout=timeout
         )
 
-        # Initialize rate limiter
-        self.rate_limiter = RateLimiter(
-            requests_per_minute=rate_limit_requests,
-            tokens_per_minute=rate_limit_tokens
-        )
-
         # Initialize cache
         self.use_cache = use_cache
-        self.cache = EmbeddingCache(cache_dir, max_cache_size) if use_cache else None
+        self.cache = None
+        if use_cache:
+            from src.utils.cache import DiskCache
+            self.cache = DiskCache(
+                name="embeddings",
+                cache_dir=cache_dir,
+                max_size_mb=1024,
+                default_ttl=86400 * 7  # 7 days
+            )
+
+        # Initialize batch optimizer
+        self.batch_optimizer = BatchOptimizer(
+            initial_batch_size=batch_size,
+            min_batch_size=max(1, batch_size // 4),
+            max_batch_size=min(100, batch_size * 4),
+            target_tokens_per_batch=8000
+        ) if use_adaptive_batching else None
+
+        # Initialize adaptive batch processor
+        self.batch_processor = AdaptiveBatchProcessor(
+            client=self.client,
+            model=self.model,
+            dimension=self.dimension,
+            batch_optimizer=self.batch_optimizer,
+            max_workers=max_workers,
+            use_parallel=use_parallel,
+            timeout=timeout
+        ) if use_adaptive_batching else None
+
+        # Initialize smart batch generator
+        self.batch_generator = SmartBatchGenerator(
+            max_tokens_per_batch=8000,
+            max_texts_per_batch=100
+        ) if smart_batching else None
 
         # Statistics
         self.stats = {
-            "total_requests": 0,
-            "successful_requests": 0,
-            "failed_requests": 0,
-            "total_tokens": 0,
-            "total_cost": 0.0,
+            "total_items": 0,
             "cache_hits": 0,
             "cache_misses": 0,
-            "batches_processed": 0,
-            "total_items": 0,
-            "start_time": None,
-            "end_time": None
+            "total_tokens": 0,
+            "total_cost": 0.0,
+            "processing_time": 0.0,
+            "batches_processed": 0
         }
 
-        logger.info(f"BatchEmbeddingGenerator initialized: model={model}, batch_size={batch_size}")
-        logger.info(f"Rate limit: {rate_limit_requests} req/min, {rate_limit_tokens} tokens/min")
-        logger.info(f"Cache: {'enabled' if use_cache else 'disabled'}")
+        logger.info(f"OptimizedEmbeddingGenerator initialized: model={model}, "
+                   f"dimension={self.dimension}, batch_size={batch_size}, "
+                   f"adaptive_batching={use_adaptive_batching}, "
+                   f"parallel={use_parallel}, smart_batching={smart_batching}")
 
     def _get_model_config(self, model: str, dimensions: Optional[int]) -> Dict[str, Any]:
         """Get model configuration."""
@@ -476,10 +691,9 @@ class BatchEmbeddingGenerator:
     def _truncate_text(self, text: str) -> str:
         """Truncate text to maximum token limit."""
         max_tokens = self.model_config["max_tokens"]
-        if len(text) <= max_tokens * 4:  # Rough estimate: 4 chars per token
+        if len(text) <= max_tokens * 4:
             return text
 
-        # More accurate truncation using tiktoken
         try:
             import tiktoken
             encoding = tiktoken.get_encoding("cl100k_base")
@@ -488,8 +702,6 @@ class BatchEmbeddingGenerator:
                 tokens = tokens[:max_tokens]
                 return encoding.decode(tokens)
         except ImportError:
-            # Fallback to character-based truncation
-            logger.warning("tiktoken not installed. Using approximate truncation.")
             max_chars = max_tokens * 4
             if len(text) > max_chars:
                 text = text[:max_chars]
@@ -498,75 +710,34 @@ class BatchEmbeddingGenerator:
 
     def _estimate_tokens(self, texts: List[str]) -> int:
         """Estimate total tokens for a batch."""
-        total_chars = sum(len(self._truncate_text(t)) for t in texts)
-        return int(total_chars / 4)  # Rough estimate
+        return sum(len(t) // 4 for t in texts)
 
     def _calculate_cost(self, total_tokens: int) -> float:
         """Calculate cost for embedding tokens."""
         cost_per_1k = self.model_config["cost_per_1k_tokens"]
         return (total_tokens / 1000) * cost_per_1k
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type((RateLimitError, APIError, APIConnectionError)),
-        before_sleep=before_sleep_log(logger, logging.WARNING)
-    )
-    def _generate_embeddings_batch(self, texts: List[str]) -> Tuple[List[List[float]], int]:
-        """
-        Generate embeddings for a batch of texts with retry logic.
-
-        Returns:
-            Tuple of (embeddings list, total_tokens_used)
-        """
-        # Truncate texts
-        truncated_texts = [self._truncate_text(t) for t in texts]
-
-        # Estimate tokens for rate limiting
-        estimated_tokens = self._estimate_tokens(truncated_texts)
-
-        # Apply rate limiting
-        self.rate_limiter.wait(tokens=estimated_tokens)
-
-        try:
-            response: CreateEmbeddingResponse = self.client.embeddings.create(
-                model=self.model,
-                input=truncated_texts,
-                dimensions=self.model_config.get("dimension")
-            )
-
-            embeddings = [data.embedding for data in response.data]
-            total_tokens = response.usage.total_tokens
-
-            self.stats["successful_requests"] += 1
-            self.stats["total_tokens"] += total_tokens
-            self.stats["total_cost"] += self._calculate_cost(total_tokens)
-
-            return embeddings, total_tokens
-
-        except Exception as e:
-            self.stats["failed_requests"] += 1
-            logger.error(f"Batch embedding generation failed: {e}")
-            raise
-
     def generate_embeddings(
         self,
         chunks: List[Union[str, Dict[str, Any]]],
         show_progress: Optional[bool] = None,
-        return_cached: bool = True
+        return_cached: bool = True,
+        use_batching: bool = True
     ) -> List[EmbeddingResult]:
         """
-        Generate embeddings for multiple chunks with batch processing and caching.
+        Generate embeddings with optimized batching.
 
         Args:
             chunks: List of either text strings or dicts with 'text' and 'metadata' keys
-            show_progress: Whether to show progress bar (overrides default)
+            show_progress: Whether to show progress bar
             return_cached: Whether to return cached results immediately
+            use_batching: Whether to use batching (always True for large datasets)
 
         Returns:
             List of EmbeddingResult objects
         """
-        self.stats["start_time"] = time.time()
+        start_time = time.time()
+        show_prog = show_progress if show_progress is not None else self.show_progress
 
         # Parse chunks
         texts = []
@@ -592,12 +763,20 @@ class BatchEmbeddingGenerator:
 
         if self.use_cache:
             for idx, text in enumerate(texts):
-                cached = self.cache.get(text, self.model)
+                cached = self.cache.get(text, self.model) if self.cache else None
                 if cached and return_cached:
-                    # Copy metadata to cached result
-                    cached.metadata.update(metadata_list[idx])
-                    cached.chunk_index = chunk_indices[idx]
-                    results[idx] = cached
+                    # Convert cached embedding to list if needed
+                    if isinstance(cached, np.ndarray):
+                        cached = cached.tolist()
+
+                    result = EmbeddingResult(
+                        text=text,
+                        embedding=cached,
+                        metadata=metadata_list[idx],
+                        chunk_index=chunk_indices[idx],
+                        model=self.model
+                    )
+                    results[idx] = result
                     self.stats["cache_hits"] += 1
                 else:
                     uncached_indices.append(idx)
@@ -609,42 +788,67 @@ class BatchEmbeddingGenerator:
             uncached_texts = texts
             uncached_metadata = metadata_list
 
-        # Generate embeddings for uncached chunks in batches
+        # Generate embeddings for uncached chunks
         if uncached_texts:
             logger.info(f"Generating embeddings for {len(uncached_texts)} uncached chunks")
 
-            batch_embeddings = []
-            batch_tokens = []
+            # Truncate texts
+            truncated_texts = [self._truncate_text(t) for t in uncached_texts]
 
-            # Process in batches
-            total_batches = (len(uncached_texts) + self.batch_size - 1) // self.batch_size
+            # Use smart batching if enabled
+            if self.smart_batching and self.batch_generator:
+                batches = self.batch_generator.generate_batches(truncated_texts)
+            else:
+                # Use fixed batch size
+                batch_size = self.batch_optimizer.current_batch_size if self.batch_optimizer else 20
+                batches = [truncated_texts[i:i+batch_size] for i in range(0, len(truncated_texts), batch_size)]
 
-            iterator = range(0, len(uncached_texts), self.batch_size)
-            if self.show_progress if show_progress is None else show_progress:
-                try:
-                    from tqdm import tqdm
-                    iterator = tqdm(iterator, total=total_batches, desc="Generating embeddings")
-                except ImportError:
-                    pass
+            # Process batches
+            all_embeddings = []
+            total_tokens = 0
 
-            for i in iterator:
-                batch_texts = uncached_texts[i:i + self.batch_size]
+            if self.use_adaptive_batching and self.batch_processor:
+                # Use adaptive batch processor
+                embeddings, tokens, batch_ids = self.batch_processor.process(
+                    truncated_texts,
+                    show_progress=show_prog
+                )
+                all_embeddings = embeddings
+                total_tokens = tokens
+                self.stats["batches_processed"] = len(batch_ids)
+            else:
+                # Simple batch processing
+                if show_prog:
+                    try:
+                        from tqdm import tqdm
+                        iterator = tqdm(batches, desc="Generating embeddings")
+                    except ImportError:
+                        iterator = batches
+                else:
+                    iterator = batches
 
-                try:
-                    embeddings, tokens = self._generate_embeddings_batch(batch_texts)
-                    batch_embeddings.extend(embeddings)
-                    batch_tokens.append(tokens)
-                    self.stats["batches_processed"] += 1
+                for batch in iterator:
+                    try:
+                        response = self.client.embeddings.create(
+                            model=self.model,
+                            input=batch,
+                            dimensions=self.dimension
+                        )
 
-                except Exception as e:
-                    logger.error(f"Failed to process batch starting at index {i}: {e}")
-                    # Add zero embeddings for failed batch
-                    for _ in batch_texts:
-                        batch_embeddings.append([0.0] * self.model_config["dimension"])
+                        embeddings = [data.embedding for data in response.data]
+                        all_embeddings.extend(embeddings)
+                        total_tokens += response.usage.total_tokens
+                        self.stats["batches_processed"] += 1
+
+                    except Exception as e:
+                        logger.error(f"Batch processing failed: {e}")
+                        # Add zero embeddings for failed batch
+                        for _ in batch:
+                            all_embeddings.append([0.0] * self.dimension)
 
             # Create results for uncached chunks
             for idx, (embedding, text, metadata, original_idx) in enumerate(
-                zip(batch_embeddings, uncached_texts, uncached_metadata, uncached_indices)
+                zip(all_embeddings, uncached_texts, uncached_metadata, uncached_indices)
             ):
                 result = EmbeddingResult(
                     text=text,
@@ -656,248 +860,36 @@ class BatchEmbeddingGenerator:
                 )
 
                 # Cache the result
-                if self.use_cache:
-                    self.cache.set(text, self.model, result)
+                if self.use_cache and self.cache:
+                    self.cache.set(text, self.model, embedding)
 
                 results[original_idx] = result
                 self.stats["total_items"] += 1
+
+            # Update cost
+            self.stats["total_tokens"] += total_tokens
+            self.stats["total_cost"] += self._calculate_cost(total_tokens)
 
         # Calculate processing time
-        self.stats["end_time"] = time.time()
-        processing_time = self.stats["end_time"] - self.stats["start_time"]
+        self.stats["processing_time"] = time.time() - start_time
 
         # Log statistics
-        self._log_stats(processing_time)
+        self._log_stats()
 
         return results
 
-    async def generate_embeddings_async(
-        self,
-        chunks: List[Union[str, Dict[str, Any]]],
-        max_concurrent: int = 10,
-        show_progress: Optional[bool] = None
-    ) -> List[EmbeddingResult]:
-        """
-        Asynchronously generate embeddings with concurrency control.
-
-        Args:
-            chunks: List of chunks to embed
-            max_concurrent: Maximum number of concurrent requests
-            show_progress: Whether to show progress bar
-
-        Returns:
-            List of EmbeddingResult objects
-        """
-        self.stats["start_time"] = time.time()
-
-        # Parse chunks
-        texts = []
-        metadata_list = []
-        chunk_indices = []
-
-        for i, chunk in enumerate(chunks):
-            if isinstance(chunk, str):
-                texts.append(chunk)
-                metadata_list.append({})
-            else:
-                texts.append(chunk.get("text", ""))
-                metadata_list.append(chunk.get("metadata", {}))
-            chunk_indices.append(i)
-
-        # Check cache first
-        results = [None] * len(texts)
-        uncached_indices = []
-        uncached_texts = []
-
-        if self.use_cache:
-            for idx, text in enumerate(texts):
-                cached = self.cache.get(text, self.model)
-                if cached:
-                    cached.metadata.update(metadata_list[idx])
-                    cached.chunk_index = chunk_indices[idx]
-                    results[idx] = cached
-                    self.stats["cache_hits"] += 1
-                else:
-                    uncached_indices.append(idx)
-                    uncached_texts.append(text)
-                    self.stats["cache_misses"] += 1
-        else:
-            uncached_indices = list(range(len(texts)))
-            uncached_texts = texts
-
-        if uncached_texts:
-            # Create semaphore for concurrency control
-            semaphore = asyncio.Semaphore(max_concurrent)
-
-            async def process_one(text, original_idx):
-                async with semaphore:
-                    # Estimate tokens
-                    estimated_tokens = self._estimate_tokens([text])
-
-                    # Apply rate limiting
-                    await self.rate_limiter.wait_async(tokens=estimated_tokens)
-
-                    # Generate embedding
-                    truncated = self._truncate_text(text)
-
-                    try:
-                        response = await self.async_client.embeddings.create(
-                            model=self.model,
-                            input=[truncated],
-                            dimensions=self.model_config.get("dimension")
-                        )
-
-                        embedding = response.data[0].embedding
-                        total_tokens = response.usage.total_tokens
-
-                        self.stats["successful_requests"] += 1
-                        self.stats["total_tokens"] += total_tokens
-                        self.stats["total_cost"] += self._calculate_cost(total_tokens)
-
-                        return embedding, total_tokens
-
-                    except Exception as e:
-                        self.stats["failed_requests"] += 1
-                        logger.error(f"Async embedding failed for text: {e}")
-                        return [0.0] * self.model_config["dimension"], 0
-
-            # Process all chunks with concurrency control
-            tasks = [
-                process_one(text, idx)
-                for idx, text in zip(uncached_indices, uncached_texts)
-            ]
-
-            # Show progress if requested
-            if self.show_progress if show_progress is None else show_progress:
-                try:
-                    from tqdm.asyncio import tqdm
-                    results_async = await tqdm.gather(*tasks, desc="Generating embeddings")
-                except ImportError:
-                    results_async = await asyncio.gather(*tasks)
-            else:
-                results_async = await asyncio.gather(*tasks)
-
-            # Process results
-            for (embedding, tokens), original_idx in zip(results_async, uncached_indices):
-                result = EmbeddingResult(
-                    text=texts[original_idx],
-                    embedding=embedding,
-                    metadata=metadata_list[original_idx],
-                    chunk_index=chunk_indices[original_idx],
-                    model=self.model,
-                    tokens_used=tokens
-                )
-
-                if self.use_cache:
-                    self.cache.set(texts[original_idx], self.model, result)
-
-                results[original_idx] = result
-                self.stats["total_items"] += 1
-
-        self.stats["end_time"] = time.time()
-        processing_time = self.stats["end_time"] - self.stats["start_time"]
-        self._log_stats(processing_time)
-
-        return results
-
-    def generate_embeddings_stream(
-        self,
-        chunks: List[Union[str, Dict[str, Any]]]
-    ) -> Iterator[EmbeddingResult]:
-        """
-        Generate embeddings as a stream, yielding results as they complete.
-
-        Args:
-            chunks: List of chunks to embed
-
-        Yields:
-            EmbeddingResult objects as they are generated
-        """
-        # Parse chunks
-        texts = []
-        metadata_list = []
-
-        for chunk in chunks:
-            if isinstance(chunk, str):
-                texts.append(chunk)
-                metadata_list.append({})
-            else:
-                texts.append(chunk.get("text", ""))
-                metadata_list.append(chunk.get("metadata", {}))
-
-        # Process in batches
-        for i in range(0, len(texts), self.batch_size):
-            batch_texts = texts[i:i + self.batch_size]
-            batch_metadata = metadata_list[i:i + self.batch_size]
-
-            # Check cache for each text
-            batch_results = []
-            texts_to_process = []
-            indices_to_process = []
-
-            for idx, text in enumerate(batch_texts):
-                if self.use_cache:
-                    cached = self.cache.get(text, self.model)
-                    if cached:
-                        cached.metadata.update(batch_metadata[idx])
-                        batch_results.append(cached)
-                        self.stats["cache_hits"] += 1
-                        continue
-
-                texts_to_process.append(text)
-                indices_to_process.append(idx)
-                self.stats["cache_misses"] += 1
-
-            # Process uncached texts
-            if texts_to_process:
-                try:
-                    embeddings, tokens = self._generate_embeddings_batch(texts_to_process)
-
-                    for idx, (embedding, text, metadata) in enumerate(
-                        zip(embeddings, texts_to_process,
-                            [batch_metadata[i] for i in indices_to_process])
-                    ):
-                        result = EmbeddingResult(
-                            text=text,
-                            embedding=embedding,
-                            metadata=metadata,
-                            model=self.model,
-                            tokens_used=self._estimate_tokens([text])
-                        )
-
-                        if self.use_cache:
-                            self.cache.set(text, self.model, result)
-
-                        batch_results.append(result)
-                        self.stats["total_items"] += 1
-
-                except Exception as e:
-                    logger.error(f"Batch processing failed: {e}")
-                    # Yield zero embeddings for failed items
-                    for text in texts_to_process:
-                        result = EmbeddingResult(
-                            text=text,
-                            embedding=[0.0] * self.model_config["dimension"],
-                            metadata={},
-                            model=self.model
-                        )
-                        batch_results.append(result)
-
-            # Yield results in original order
-            for result in batch_results:
-                yield result
-
-    def _log_stats(self, processing_time: float):
-        """Log processing statistics."""
+    def _log_stats(self):
+        """Log generation statistics."""
         total_items = self.stats["total_items"]
         total_tokens = self.stats["total_tokens"]
         total_cost = self.stats["total_cost"]
         cache_hits = self.stats["cache_hits"]
         cache_misses = self.stats["cache_misses"]
+        processing_time = self.stats["processing_time"]
 
-        logger.info("=" * 50)
-        logger.info("EMBEDDING GENERATION STATISTICS")
-        logger.info("=" * 50)
+        logger.info("=" * 60)
+        logger.info("EMBEDDING GENERATION STATISTICS (Optimized)")
+        logger.info("=" * 60)
         logger.info(f"Total items processed:  {total_items}")
         logger.info(f"Total tokens used:      {total_tokens}")
         logger.info(f"Total cost:             ${total_cost:.6f}")
@@ -909,116 +901,124 @@ class BatchEmbeddingGenerator:
             logger.info(f"Cache hit rate:         {hit_rate:.2%}")
 
         logger.info(f"Batches processed:      {self.stats['batches_processed']}")
-        logger.info(f"Successful requests:    {self.stats['successful_requests']}")
-        logger.info(f"Failed requests:        {self.stats['failed_requests']}")
         logger.info(f"Processing time:        {processing_time:.2f}s")
 
-        if total_items > 0:
+        if total_items > 0 and processing_time > 0:
             items_per_second = total_items / processing_time
+            tokens_per_second = total_tokens / processing_time
             logger.info(f"Throughput:             {items_per_second:.1f} items/s")
+            logger.info(f"Token throughput:       {tokens_per_second:.0f} tokens/s")
 
-        logger.info("=" * 50)
+        if self.batch_optimizer:
+            logger.info(f"Current batch size:     {self.batch_optimizer.current_batch_size}")
+
+        logger.info("=" * 60)
 
     def get_stats(self) -> Dict[str, Any]:
         """Get current statistics."""
-        cache_stats = self.cache.get_stats() if self.cache else {}
-        rate_limiter_stats = self.rate_limiter.get_stats()
+        stats = self.stats.copy()
 
-        return {
-            **self.stats,
-            "cache": cache_stats,
-            "rate_limiter": rate_limiter_stats,
+        if self.cache:
+            stats["cache_stats"] = self.cache.get_stats() if hasattr(self.cache, 'get_stats') else {}
+
+        if self.batch_optimizer:
+            stats["batch_optimizer"] = self.batch_optimizer.get_stats()
+
+        stats["model_info"] = {
             "model": self.model,
-            "dimension": self.model_config["dimension"],
-            "batch_size": self.batch_size
+            "dimension": self.dimension,
+            "max_tokens": self.model_config["max_tokens"],
+            "cost_per_1k_tokens": self.model_config["cost_per_1k_tokens"]
         }
+
+        return stats
 
     def clear_cache(self):
         """Clear the embedding cache."""
         if self.cache:
             self.cache.clear()
-            logger.info("Cache cleared")
-
-    def get_model_info(self) -> Dict[str, Any]:
-        """Get information about the current model."""
-        return {
-            "model": self.model,
-            "dimension": self.model_config["dimension"],
-            "max_tokens": self.model_config["max_tokens"],
-            "cost_per_1k_tokens": self.model_config["cost_per_1k_tokens"],
-            "description": self.model_config["description"]
-        }
+            logger.info("Embedding cache cleared")
 
 
-# Convenience function for batch embedding
-def generate_embeddings_batch(
+# ============================================================
+# Convenience Function
+# ============================================================
+
+def generate_embeddings_optimized(
     texts: List[str],
     model: str = "text-embedding-3-small",
-    api_key: Optional[str] = None,
     batch_size: int = 20,
     use_cache: bool = True,
-    show_progress: bool = True
+    show_progress: bool = True,
+    use_adaptive_batching: bool = True,
+    use_parallel: bool = True,
+    smart_batching: bool = True
 ) -> List[List[float]]:
     """
-    Quick helper function to generate embeddings for a list of texts.
+    Quick helper function to generate embeddings with optimized batching.
 
     Args:
         texts: List of text strings to embed
         model: OpenAI embedding model
-        api_key: OpenAI API key
-        batch_size: Batch size for processing
+        batch_size: Initial batch size
         use_cache: Whether to use cache
         show_progress: Whether to show progress
+        use_adaptive_batching: Whether to use adaptive batching
+        use_parallel: Whether to use parallel processing
+        smart_batching: Whether to use smart batching
 
     Returns:
         List of embedding vectors
     """
-    generator = BatchEmbeddingGenerator(
+    generator = OptimizedEmbeddingGenerator(
         model=model,
-        api_key=api_key,
         batch_size=batch_size,
         use_cache=use_cache,
-        show_progress=show_progress
+        show_progress=show_progress,
+        use_adaptive_batching=use_adaptive_batching,
+        use_parallel=use_parallel,
+        smart_batching=smart_batching
     )
 
-    chunks = [{"text": text, "metadata": {}} for text in texts]
-    results = generator.generate_embeddings(chunks, show_progress=show_progress)
+    chunks = [{"text": t, "metadata": {}} for t in texts]
+    results = generator.generate_embeddings(chunks)
 
     return [result.embedding for result in results]
 
 
 if __name__ == "__main__":
-    # Example usage with batch processing
+    # Example usage with optimized batching
     logging.basicConfig(level=logging.INFO)
 
-    # Create generator with batch support
-    generator = BatchEmbeddingGenerator(
+    # Create optimized generator
+    generator = OptimizedEmbeddingGenerator(
         model="text-embedding-3-small",
-        batch_size=10,
-        rate_limit_requests=50,
+        batch_size=20,
+        use_adaptive_batching=True,
+        use_parallel=True,
+        smart_batching=True,
         use_cache=True
     )
 
     # Sample texts
     sample_texts = [
-        "This is the first document.",
-        "This is the second document with more content.",
-        "And a third one for good measure.",
-        "Machine learning is a subset of artificial intelligence.",
-        "Deep learning uses neural networks with multiple layers."
+        "This is the first document." * 10,
+        "This is the second document with more content." * 20,
+        "And a third one for good measure." * 30,
+        "Machine learning is a subset of artificial intelligence." * 40,
+        "Deep learning uses neural networks with multiple layers." * 50
     ]
 
-    # Generate embeddings in batch
+    # Generate embeddings
     chunks = [{"text": t, "metadata": {"index": i}} for i, t in enumerate(sample_texts)]
     results = generator.generate_embeddings(chunks, show_progress=True)
 
     print(f"\nGenerated {len(results)} embeddings:")
     for i, result in enumerate(results):
-        print(f"  Document {i}: {len(result.embedding)} dimensions, tokens: {result.tokens_used}")
+        print(f"  Document {i}: {len(result.embedding)} dimensions")
 
     # Get stats
     stats = generator.get_stats()
-    print(f"\nStatistics:")
-    print(f"  Total items: {stats['total_items']}")
-    print(f"  Cache hits: {stats['cache_hits']}")
-    print(f"  Total cost: ${stats['total_cost']:.6f}")
+    print(f"\nPerformance Statistics:")
+    print(f"  Throughput: {stats.get('throughput_items_per_second', 0):.1f} items/s")
+    print(f"  Total cost: ${stats.get('total_cost', 0):.6f}")

@@ -1,0 +1,112 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: docqa-config
+  namespace: docqa
+  labels:
+    app: docqa-ai
+    component: config
+data:
+  app-config.yaml: |
+    # Application Configuration
+    environment: production
+    debug: false
+    version: "1.0.0"
+
+    # LLM Configuration
+    llm:
+      provider: openai
+      model: gpt-4
+      temperature: 0.3
+      max_tokens: 2000
+      timeout: 60
+      max_retries: 5
+
+    # Embedding Configuration
+    embedding:
+      provider: openai
+      model: text-embedding-3-small
+      dimension: 1536
+      batch_size: 50
+      cache_enabled: true
+      cache_dir: /app/data/embeddings/cache
+
+    # Vector Store Configuration
+    vector_store:
+      store_type: faiss
+      index_type: HNSW64
+      index_path: /app/data/vector_store
+      dimension: 1536
+      metric: cosine
+      ef_search: 200
+      ef_construction: 400
+      m: 32
+
+    # Retrieval Configuration
+    retrieval:
+      top_k: 5
+      score_threshold: 0.6
+      enable_hybrid_search: true
+      enable_reranking: true
+      reranker_model: cross-encoder/ms-marco-MiniLM-L-6-v2
+      vector_weight: 0.6
+      keyword_weight: 0.4
+
+    # API Configuration
+    api:
+      host: 0.0.0.0
+      port: 8000
+      workers: 4
+      reload: false
+      log_level: WARNING
+      rate_limit: 1000/minute
+      request_timeout: 60
+      max_request_size: 104857600
+
+    # Database Configuration
+    database:
+      pool_size: 20
+      max_overflow: 40
+      pool_timeout: 30
+      pool_recycle: 3600
+      echo: false
+      ssl_mode: require
+
+    # Cache Configuration
+    cache:
+      enabled: true
+      ttl_seconds: 7200
+      max_size: 10000
+
+    # Monitoring Configuration
+    monitoring:
+      enabled: true
+      metrics_port: 9090
+      enable_tracing: true
+      log_requests: true
+      log_responses: false
+
+    # Logging Configuration
+    logging:
+      level: INFO
+      format: json
+      max_size_mb: 100
+      backup_count: 10
+      compress_old_logs: true
+
+  env-config.yaml: |
+    # Environment Variables (non-sensitive)
+    ENVIRONMENT: production
+    LOG_LEVEL: INFO
+    API_HOST: 0.0.0.0
+    API_PORT: "8000"
+    WORKERS: "4"
+    DB_HOST: postgres
+    DB_PORT: "5432"
+    DB_NAME: docqa
+    DB_USER: docqa
+    REDIS_HOST: redis
+    REDIS_PORT: "6379"
+    REDIS_DB: "0"
+    S3_DOCUMENTS_BUCKET: docqa-documents
+    S3_EMBEDDINGS_BUCKET: docqa-embeddings

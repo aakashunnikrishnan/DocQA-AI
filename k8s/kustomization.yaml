@@ -1,0 +1,43 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: docqa
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - secrets.yaml
+  - postgres.yaml
+  - redis.yaml
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml
+  - hpa.yaml
+  - service-monitor.yaml
+  - prometheus-rule.yaml
+
+commonLabels:
+  app: docqa-ai
+  managed-by: kustomize
+
+images:
+  - name: your-registry/docqa-ai
+    newName: your-registry/docqa-ai
+    newTag: latest
+
+configMapGenerator:
+  - name: docqa-config
+    behavior: merge
+    files:
+      - app-config.yaml
+
+secretGenerator:
+  - name: docqa-secrets
+    behavior: merge
+    literals:
+      - DB_PASSWORD=your-strong-password
+      - REDIS_PASSWORD=your-strong-password
+      - OPENAI_API_KEY=your-openai-key
+
+patchesStrategicMerge:
+  - patches/update-replicas.yaml

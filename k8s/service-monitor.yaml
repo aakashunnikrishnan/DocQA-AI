@@ -1,0 +1,21 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: docqa-api-monitor
+  namespace: docqa
+  labels:
+    app: docqa-ai
+    component: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: docqa-ai
+      component: api
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+  namespaceSelector:
+    matchNames:
+      - docqa

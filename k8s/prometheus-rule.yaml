@@ -1,0 +1,83 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: docqa-alerts
+  namespace: docqa
+  labels:
+    app: docqa-ai
+    component: monitoring
+spec:
+  groups:
+    - name: docqa-api
+      rules:
+        - alert: DocQAAPIDown
+          expr: up{job="docqa-api"} == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "DocQA API is down"
+            description: "The DocQA API service has been down for more than 1 minute."
+
+        - alert: DocQAAPIHighLatency
+          expr: histogram_quantile(0.95, sum(rate(docqa_api_request_duration_ms_bucket[5m])) by (le, endpoint)) > 1000
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "DocQA API high latency"
+            description: "95th percentile latency is above 1s for endpoint {{ $labels.endpoint }}"
+
+        - alert: DocQAAPIHighErrorRate
+          expr: sum(rate(docqa_api_requests_total{status=~"5.."}[5m])) / sum(rate(docqa_api_requests_total[5m])) > 0.05
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "DocQA API high error rate"
+            description: "Error rate is above 5%"
+
+        - alert: DocQAAPIHighMemory
+          expr: docqa_system_memory_usage_percent > 90
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "DocQA API high memory usage"
+            description: "Memory usage is above 90%"
+
+        - alert: DocQAAPIRateLimit
+          expr: docqa_rate_limit_exceeded_total > 0
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: "DocQA API rate limit exceeded"
+            description: "Rate limit has been exceeded {{ $value }} times"
+
+        - alert: DocQAQueueSizeHigh
+          expr: docqa_queue_size > 100
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "DocQA task queue size high"
+            description: "Task queue has {{ $value }} pending tasks"
+
+        - alert: DocQADatabaseConnectionPoolLow
+          expr: docqa_db_pool_available / docqa_db_pool_max < 0.2
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "DocQA database connection pool low"
+            description: "Database connection pool is below 20% available"
+
+        - alert: DocQAEmbeddingsErrorRate
+          expr: sum(rate(docqa_embedding_errors_total[5m])) / sum(rate(docqa_embedding_requests_total[5m])) > 0.1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "DocQA embedding error rate high"
+            description: "Embedding error rate is above 10%"

@@ -1,7 +1,7 @@
 """
 API routes for DocQA AI system with async support.
 Handles document ingestion, querying, and management endpoints.
-ENHANCED: Full streaming support with multiple formats and real-time updates.
+ENHANCED: Fixed streaming response encoding with proper Unicode handling.
 """
 
 import os
@@ -13,6 +13,8 @@ from datetime import datetime
 from pathlib import Path
 import tempfile
 import shutil
+import codecs
+import sys
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Query, Request, status, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, PlainTextResponse
@@ -43,564 +45,182 @@ router = APIRouter(tags=["docqa"])
 
 
 # ============================================================
-# Streaming Response Models
+# Streaming Response Helpers
 # ============================================================
 
-class StreamEventType:
-    """Stream event types."""
-    START = "start"
-    TOKEN = "token"
-    CHUNK = "chunk"
-    SOURCE = "source"
-    PROGRESS = "progress"
-    THOUGHT = "thought"
-    FINAL = "final"
-    ERROR = "error"
-    DONE = "done"
+class StreamingEncoder:
+    """
+    Handle encoding for streaming responses with proper Unicode support.
+    """
 
+    @staticmethod
+    def ensure_unicode(text: str) -> str:
+        """Ensure text is properly encoded as Unicode."""
+        if not isinstance(text, str):
+            try:
+                text = str(text)
+            except Exception:
+                text = ""
 
-class StreamEvent:
-    """Stream event for SSE and JSON streaming."""
+        # Handle common Unicode issues
+        try:
+            # Replace invalid Unicode characters
+            text = text.encode('utf-8', errors='replace').decode('utf-8')
+            return text
+        except Exception:
+            return text
 
-    def __init__(self, event_type: str, data: Any, event_id: Optional[str] = None):
-        self.event_type = event_type
-        self.data = data
-        self.event_id = event_id or str(time.time())
-        self.timestamp = datetime.now().isoformat()
+    @staticmethod
+    def json_encode(data: Dict[str, Any], ensure_ascii: bool = False) -> str:
+        """
+        Encode data as JSON with proper Unicode handling.
 
-    def to_sse(self) -> str:
-        """Convert to Server-Sent Events format."""
+        Args:
+            data: Data to encode
+            ensure_ascii: Whether to escape Unicode characters
+
+        Returns:
+            JSON string
+        """
+        try:
+            # Custom encoder that handles non-serializable types
+            def default_serializer(obj):
+                if isinstance(obj, datetime):
+                    return obj.isoformat()
+                if isinstance(obj, (set, frozenset)):
+                    return list(obj)
+                if hasattr(obj, 'to_dict'):
+                    return obj.to_dict()
+                if hasattr(obj, '__dict__'):
+                    return obj.__dict__
+                return str(obj)
+
+            # Encode with proper Unicode handling
+            json_str = json.dumps(
+                data,
+                default=default_serializer,
+                ensure_ascii=ensure_ascii,
+                separators=(',', ':')
+            )
+
+            # Ensure Unicode characters are properly handled
+            return StreamingEncoder.ensure_unicode(json_str)
+
+        except Exception as e:
+            logger.error(f"JSON encoding failed: {e}")
+            return json.dumps({"error": "Encoding error", "message": str(e)})
+
+    @staticmethod
+    def format_sse_event(
+        event_type: str,
+        data: Dict[str, Any],
+        event_id: Optional[str] = None,
+        retry: int = 1000
+    ) -> str:
+        """
+        Format a Server-Sent Events (SSE) message with proper encoding.
+
+        Args:
+            event_type: Event type
+            data: Event data
+            event_id: Event ID
+            retry: Retry timeout in milliseconds
+
+        Returns:
+            Formatted SSE message
+        """
+        # Encode data as JSON with Unicode support
+        json_data = StreamingEncoder.json_encode(data, ensure_ascii=False)
+
+        # Build SSE message
         lines = []
-        lines.append(f"event: {self.event_type}")
-        lines.append(f"id: {self.event_id}")
-        lines.append(f"data: {json.dumps(self.data)}")
+        if event_type:
+            lines.append(f"event: {event_type}")
+        if event_id:
+            lines.append(f"id: {event_id}")
+        if retry:
+            lines.append(f"retry: {retry}")
+
+        # Split data into multiple lines if needed (SSE spec)
+        # Each line should be prefixed with "data: "
+        for line in json_data.split('\n'):
+            lines.append(f"data: {line}")
+
+        # Add empty line to signal end of event
         lines.append("")
-        return "\n".join(lines)
 
-    def to_ndjson(self) -> str:
-        """Convert to NDJSON format."""
-        return json.dumps({
-            "event": self.event_type,
-            "id": self.event_id,
-            "timestamp": self.timestamp,
-            "data": self.data
-        }) + "\n"
+        # Join with newlines and encode with UTF-8
+        message = '\n'.join(lines)
+        return StreamingEncoder.ensure_unicode(message)
 
+    @staticmethod
+    def format_ndjson_event(
+        event_type: str,
+        data: Dict[str, Any]
+    ) -> str:
+        """
+        Format an NDJSON event with proper encoding.
 
-# ============================================================
-# Streaming Helper Functions
-# ============================================================
+        Args:
+            event_type: Event type
+            data: Event data
 
-async def stream_query_response(
-    question: str,
-    top_k: int = 5,
-    temperature: Optional[float] = None,
-    max_tokens: Optional[int] = None,
-    include_sources: bool = True,
-    stream_format: str = "sse",  # sse, ndjson, text
-    show_thoughts: bool = False
-) -> AsyncGenerator[str, None]:
-    """
-    Stream query response with progressive updates.
+        Returns:
+            Formatted NDJSON event
+        """
+        event_data = {
+            "event": event_type,
+            "timestamp": datetime.now().isoformat(),
+            "data": data
+        }
 
-    Args:
-        question: User question
-        top_k: Number of documents to retrieve
-        temperature: LLM temperature
-        max_tokens: Max tokens for response
-        include_sources: Include source citations
-        stream_format: Output format (sse, ndjson, text)
-        show_thoughts: Show thought process
+        json_data = StreamingEncoder.json_encode(event_data, ensure_ascii=False)
+        return StreamingEncoder.ensure_unicode(json_data + '\n')
 
-    Yields:
-        Formatted stream events
-    """
-    state = get_app_state()
-    start_time = time.time()
+    @staticmethod
+    def format_plain_text(text: str) -> str:
+        """
+        Format plain text with proper encoding.
 
-    # Validate state
-    if not state["retriever"] or not state["llm_interface"]:
-        yield StreamEvent(
-            StreamEventType.ERROR,
-            {"message": "System not fully initialized"}
-        ).to_sse() if stream_format == "sse" else StreamEvent(
-            StreamEventType.ERROR,
-            {"message": "System not fully initialized"}
-        ).to_ndjson()
-        return
+        Args:
+            text: Text to format
 
-    if state["vector_store"].get_size() == 0:
-        yield StreamEvent(
-            StreamEventType.ERROR,
-            {"message": "No documents ingested. Please upload documents first."}
-        ).to_sse() if stream_format == "sse" else StreamEvent(
-            StreamEventType.ERROR,
-            {"message": "No documents ingested. Please upload documents first."}
-        ).to_ndjson()
-        return
+        Returns:
+            Formatted text
+        """
+        return StreamingEncoder.ensure_unicode(text)
 
-    try:
-        # Start event
-        yield StreamEvent(
-            StreamEventType.START,
-            {
-                "question": question,
-                "top_k": top_k,
-                "model": state["config"].llm.model,
-                "timestamp": datetime.now().isoformat()
-            }
-        ).to_sse() if stream_format == "sse" else StreamEvent(
-            StreamEventType.START,
-            {
-                "question": question,
-                "top_k": top_k,
-                "model": state["config"].llm.model,
-                "timestamp": datetime.now().isoformat()
-            }
-        ).to_ndjson()
+    @staticmethod
+    def create_text_iterator(
+        text: str,
+        chunk_size: int = 50,
+        delay: float = 0.01
+    ) -> AsyncGenerator[str, None]:
+        """
+        Create an async iterator that yields text in chunks.
 
-        # Progress: Retrieving documents
-        yield StreamEvent(
-            StreamEventType.PROGRESS,
-            {"stage": "retrieving", "message": "Searching for relevant documents...", "progress": 0.2}
-        ).to_sse() if stream_format == "sse" else StreamEvent(
-            StreamEventType.PROGRESS,
-            {"stage": "retrieving", "message": "Searching for relevant documents...", "progress": 0.2}
-        ).to_ndjson()
+        Args:
+            text: Text to stream
+            chunk_size: Size of chunks in characters
+            delay: Delay between chunks in seconds
 
-        # Retrieve documents
-        retrieval_start = time.time()
-        retrieval_results = await run_in_threadpool(
-            state["retriever"].retrieve,
-            question,
-            top_k=top_k
-        )
-        retrieval_time = (time.time() - retrieval_start) * 1000
+        Yields:
+            Chunks of text
+        """
+        async def generator():
+            # Ensure text is properly encoded
+            text = StreamingEncoder.ensure_unicode(text)
 
-        if not retrieval_results:
-            yield StreamEvent(
-                StreamEventType.FINAL,
-                {
-                    "answer": "I couldn't find any relevant information in the documents to answer your question.",
-                    "confidence": 0.0,
-                    "sources": [],
-                    "tokens_used": 0,
-                    "processing_time_ms": (time.time() - start_time) * 1000
-                }
-            ).to_sse() if stream_format == "sse" else StreamEvent(
-                StreamEventType.FINAL,
-                {
-                    "answer": "I couldn't find any relevant information in the documents to answer your question.",
-                    "confidence": 0.0,
-                    "sources": [],
-                    "tokens_used": 0,
-                    "processing_time_ms": (time.time() - start_time) * 1000
-                }
-            ).to_ndjson()
+            # Stream chunks
+            for i in range(0, len(text), chunk_size):
+                chunk = text[i:i + chunk_size]
+                # Ensure chunk is properly encoded
+                chunk = StreamingEncoder.ensure_unicode(chunk)
+                yield chunk
+                if delay > 0:
+                    await asyncio.sleep(delay)
 
-            yield StreamEvent(
-                StreamEventType.DONE,
-                {"timestamp": datetime.now().isoformat()}
-            ).to_sse() if stream_format == "sse" else StreamEvent(
-                StreamEventType.DONE,
-                {"timestamp": datetime.now().isoformat()}
-            ).to_ndjson()
-            return
-
-        # Send sources
-        if include_sources:
-            sources = []
-            for r in retrieval_results[:5]:
-                sources.append({
-                    "text": r.text[:300] + "..." if len(r.text) > 300 else r.text,
-                    "score": r.score,
-                    "metadata": r.metadata
-                })
-
-            yield StreamEvent(
-                StreamEventType.SOURCE,
-                {"sources": sources, "retrieval_time_ms": retrieval_time}
-            ).to_sse() if stream_format == "sse" else StreamEvent(
-                StreamEventType.SOURCE,
-                {"sources": sources, "retrieval_time_ms": retrieval_time}
-            ).to_ndjson()
-
-        # Progress: Generating response
-        yield StreamEvent(
-            StreamEventType.PROGRESS,
-            {"stage": "generating", "message": f"Generating response using {len(retrieval_results)} sources...", "progress": 0.5}
-        ).to_sse() if stream_format == "sse" else StreamEvent(
-            StreamEventType.PROGRESS,
-            {"stage": "generating", "message": f"Generating response using {len(retrieval_results)} sources...", "progress": 0.5}
-        ).to_ndjson()
-
-        # Prepare context
-        context_chunks = [
-            {"text": r.text, "source": r.metadata.get("file_path", "Unknown")}
-            for r in retrieval_results[:3]
-        ]
-
-        # Generate prompt
-        prompt = get_rag_prompt(
-            question=question,
-            chunks=context_chunks
-        )
-
-        # Stream LLM response
-        full_response = ""
-        token_count = 0
-        thought_parts = []
-
-        if show_thoughts:
-            yield StreamEvent(
-                StreamEventType.THOUGHT,
-                {"content": "Analyzing query and context...", "stage": "analysis"}
-            ).to_sse() if stream_format == "sse" else StreamEvent(
-                StreamEventType.THOUGHT,
-                {"content": "Analyzing query and context...", "stage": "analysis"}
-            ).to_ndjson()
-
-        # Generate response with streaming
-        llm_stream = await run_in_threadpool(
-            state["llm_interface"].generate,
-            [{"role": "user", "content": prompt}],
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=True
-        )
-
-        # Process stream
-        for chunk in llm_stream:
-            if isinstance(chunk, LLMResponse) and chunk.content:
-                token_count += 1
-                full_response += chunk.content
-
-                # Send token chunk
-                yield StreamEvent(
-                    StreamEventType.TOKEN,
-                    {"content": chunk.content, "token_count": token_count}
-                ).to_sse() if stream_format == "sse" else StreamEvent(
-                    StreamEventType.TOKEN,
-                    {"content": chunk.content, "token_count": token_count}
-                ).to_ndjson()
-
-                # Update progress
-                if token_count % 10 == 0:
-                    progress = min(0.9, 0.5 + (token_count / 100) * 0.4)
-                    yield StreamEvent(
-                        StreamEventType.PROGRESS,
-                        {"stage": "generating", "message": f"Generating... ({token_count} tokens)", "progress": progress}
-                    ).to_sse() if stream_format == "sse" else StreamEvent(
-                        StreamEventType.PROGRESS,
-                        {"stage": "generating", "message": f"Generating... ({token_count} tokens)", "progress": progress}
-                    ).to_ndjson()
-
-        # Show thoughts about completion
-        if show_thoughts:
-            thought_parts.append("Response generated successfully")
-            yield StreamEvent(
-                StreamEventType.THOUGHT,
-                {"content": "Response generated successfully", "stage": "completion"}
-            ).to_sse() if stream_format == "sse" else StreamEvent(
-                StreamEventType.THOUGHT,
-                {"content": "Response generated successfully", "stage": "completion"}
-            ).to_ndjson()
-
-        # Post-process response
-        processed_response = await run_in_threadpool(
-            postprocess_response,
-            full_response,
-            str(context_chunks[:3]),
-            aggressive_cleaning=True
-        )
-
-        # Prepare final response
-        final_sources = []
-        if include_sources:
-            for r in retrieval_results[:5]:
-                final_sources.append({
-                    "text": r.text[:500] + "..." if len(r.text) > 500 else r.text,
-                    "score": r.score,
-                    "metadata": r.metadata
-                })
-
-        # Send final response
-        yield StreamEvent(
-            StreamEventType.FINAL,
-            {
-                "answer": processed_response.cleaned_text,
-                "confidence": processed_response.confidence,
-                "sources": final_sources,
-                "tokens_used": token_count,
-                "has_hallucination": processed_response.has_hallucination,
-                "processing_time_ms": (time.time() - start_time) * 1000,
-                "retrieval_time_ms": retrieval_time,
-                "generation_time_ms": (time.time() - retrieval_start) * 1000
-            }
-        ).to_sse() if stream_format == "sse" else StreamEvent(
-            StreamEventType.FINAL,
-            {
-                "answer": processed_response.cleaned_text,
-                "confidence": processed_response.confidence,
-                "sources": final_sources,
-                "tokens_used": token_count,
-                "has_hallucination": processed_response.has_hallucination,
-                "processing_time_ms": (time.time() - start_time) * 1000,
-                "retrieval_time_ms": retrieval_time,
-                "generation_time_ms": (time.time() - retrieval_start) * 1000
-            }
-        ).to_ndjson()
-
-        # Done event
-        yield StreamEvent(
-            StreamEventType.DONE,
-            {"timestamp": datetime.now().isoformat()}
-        ).to_sse() if stream_format == "sse" else StreamEvent(
-            StreamEventType.DONE,
-            {"timestamp": datetime.now().isoformat()}
-        ).to_ndjson()
-
-    except Exception as e:
-        logger.error(f"Streaming query failed: {e}", exc_info=True)
-        yield StreamEvent(
-            StreamEventType.ERROR,
-            {"message": str(e), "type": type(e).__name__}
-        ).to_sse() if stream_format == "sse" else StreamEvent(
-            StreamEventType.ERROR,
-            {"message": str(e), "type": type(e).__name__}
-        ).to_ndjson()
-
-
-async def stream_document_ingestion(
-    files: List[UploadFile],
-    chunk_size: int = 800,
-    chunk_overlap: int = 150,
-    chunking_strategy: str = "adaptive"
-) -> AsyncGenerator[str, None]:
-    """
-    Stream document ingestion with progress updates.
-
-    Args:
-        files: List of uploaded files
-        chunk_size: Size of chunks
-        chunk_overlap: Overlap between chunks
-        chunking_strategy: Chunking strategy
-
-    Yields:
-        Stream events for ingestion progress
-    """
-    state = get_app_state()
-    loader = DocumentLoader()
-
-    try:
-        # Start event
-        yield StreamEvent(
-            StreamEventType.START,
-            {
-                "files": [f.filename for f in files],
-                "chunk_size": chunk_size,
-                "chunk_overlap": chunk_overlap,
-                "chunking_strategy": chunking_strategy
-            }
-        ).to_ndjson()
-
-        # Validate files
-        config = state["config"]
-        max_size = config.processing.max_file_size_mb * 1024 * 1024
-
-        for file in files:
-            await file.seek(0, 2)
-            size = await file.tell()
-            await file.seek(0)
-
-            if size > max_size:
-                yield StreamEvent(
-                    StreamEventType.ERROR,
-                    {"file": file.filename, "message": f"File exceeds maximum size of {config.processing.max_file_size_mb}MB"}
-                ).to_ndjson()
-                return
-
-        # Progress: Uploading files
-        yield StreamEvent(
-            StreamEventType.PROGRESS,
-            {"stage": "uploading", "message": "Uploading files...", "progress": 0.1}
-        ).to_ndjson()
-
-        # Save uploaded files
-        with tempfile.TemporaryDirectory() as temp_dir:
-            uploaded_files = []
-            failed_files = []
-
-            for file in files:
-                file_path = Path(temp_dir) / file.filename
-                try:
-                    content = await file.read()
-                    with open(file_path, 'wb') as f:
-                        f.write(content)
-                    uploaded_files.append(str(file_path))
-                    yield StreamEvent(
-                        StreamEventType.PROGRESS,
-                        {"stage": "uploading", "file": file.filename, "message": f"Uploaded {file.filename}", "progress": 0.2}
-                    ).to_ndjson()
-                except Exception as e:
-                    failed_files.append(file.filename)
-                    yield StreamEvent(
-                        StreamEventType.ERROR,
-                        {"file": file.filename, "message": str(e)}
-                    ).to_ndjson()
-
-            if not uploaded_files:
-                yield StreamEvent(
-                    StreamEventType.ERROR,
-                    {"message": "No valid files uploaded"}
-                ).to_ndjson()
-                yield StreamEvent(StreamEventType.DONE, {}).to_ndjson()
-                return
-
-            # Progress: Loading documents
-            yield StreamEvent(
-                StreamEventType.PROGRESS,
-                {"stage": "loading", "message": "Loading documents...", "progress": 0.3}
-            ).to_ndjson()
-
-            # Load documents
-            documents = []
-            for file_path in uploaded_files:
-                try:
-                    doc = loader.load_document(file_path)
-                    documents.append(doc)
-                    yield StreamEvent(
-                        StreamEventType.PROGRESS,
-                        {"stage": "loading", "file": Path(file_path).name, "message": f"Loaded {Path(file_path).name}", "progress": 0.4}
-                    ).to_ndjson()
-                except Exception as e:
-                    failed_files.append(Path(file_path).name)
-                    yield StreamEvent(
-                        StreamEventType.ERROR,
-                        {"file": Path(file_path).name, "message": str(e)}
-                    ).to_ndjson()
-
-            if not documents:
-                yield StreamEvent(
-                    StreamEventType.ERROR,
-                    {"message": "No documents could be loaded"}
-                ).to_ndjson()
-                yield StreamEvent(StreamEventType.DONE, {}).to_ndjson()
-                return
-
-            # Progress: Chunking documents
-            yield StreamEvent(
-                StreamEventType.PROGRESS,
-                {"stage": "chunking", "message": "Chunking documents...", "progress": 0.5}
-            ).to_ndjson()
-
-            # Chunk documents
-            chunking_pipeline = ChunkingPipeline(
-                strategy=chunking_strategy,
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_overlap
-            )
-
-            chunks = []
-            for doc in documents:
-                doc_chunks = await run_in_threadpool(
-                    chunking_pipeline.chunk_document,
-                    doc["content"],
-                    doc["metadata"]
-                )
-                chunks.extend(doc_chunks)
-
-            if not chunks:
-                yield StreamEvent(
-                    StreamEventType.ERROR,
-                    {"message": "No chunks could be created"}
-                ).to_ndjson()
-                yield StreamEvent(StreamEventType.DONE, {}).to_ndjson()
-                return
-
-            yield StreamEvent(
-                StreamEventType.PROGRESS,
-                {"stage": "chunking", "message": f"Created {len(chunks)} chunks", "progress": 0.6}
-            ).to_ndjson()
-
-            # Progress: Generating embeddings
-            yield StreamEvent(
-                StreamEventType.PROGRESS,
-                {"stage": "embedding", "message": "Generating embeddings...", "progress": 0.7}
-            ).to_ndjson()
-
-            # Generate embeddings
-            embedding_generator = state["embedding_generator"]
-            chunk_data = [
-                {"text": chunk.text, "metadata": chunk.metadata}
-                for chunk in chunks
-            ]
-
-            embeddings = await embedding_generator.generate_embeddings_async(chunk_data)
-
-            yield StreamEvent(
-                StreamEventType.PROGRESS,
-                {"stage": "embedding", "message": f"Generated {len(embeddings)} embeddings", "progress": 0.85}
-            ).to_ndjson()
-
-            # Store in vector store
-            vector_store = state["vector_store"]
-            if not vector_store:
-                yield StreamEvent(
-                    StreamEventType.ERROR,
-                    {"message": "Vector store not initialized"}
-                ).to_ndjson()
-                yield StreamEvent(StreamEventType.DONE, {}).to_ndjson()
-                return
-
-            # Add embeddings
-            embedding_vectors = [e.embedding for e in embeddings]
-            texts = [e.text for e in embeddings]
-            metadata_list = [e.metadata for e in embeddings]
-            chunk_ids = [f"chunk_{i}" for i in range(len(embeddings))]
-
-            indices = await run_in_threadpool(
-                vector_store.add_embeddings,
-                embedding_vectors,
-                texts,
-                metadata_list,
-                chunk_ids
-            )
-
-            # Generate document IDs
-            document_ids = []
-            for doc in documents:
-                doc_id = f"doc_{datetime.now().strftime('%Y%m%d%H%M%S')}_{len(document_ids)}"
-                document_ids.append(doc_id)
-
-            # Final event
-            yield StreamEvent(
-                StreamEventType.FINAL,
-                {
-                    "success": True,
-                    "document_ids": document_ids,
-                    "total_chunks": len(chunks),
-                    "total_documents": len(documents),
-                    "failed_files": failed_files,
-                    "vector_store_size": vector_store.get_size()
-                }
-            ).to_ndjson()
-
-            # Progress: Complete
-            yield StreamEvent(
-                StreamEventType.PROGRESS,
-                {"stage": "complete", "message": "Ingestion complete!", "progress": 1.0}
-            ).to_ndjson()
-
-    except Exception as e:
-        logger.error(f"Streaming ingestion failed: {e}", exc_info=True)
-        yield StreamEvent(
-            StreamEventType.ERROR,
-            {"message": str(e), "type": type(e).__name__}
-        ).to_ndjson()
-
-    finally:
-        yield StreamEvent(StreamEventType.DONE, {}).to_ndjson()
+        return generator()
 
 
 # ============================================================
@@ -635,47 +255,94 @@ async def query_stream(
         "text": "text/plain"
     }
 
+    # Additional headers for streaming
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",  # Disable nginx buffering
+        "Content-Encoding": "identity",  # Prevent compression issues
+        "Transfer-Encoding": "chunked"
+    }
+
+    # For SSE, add specific headers
+    if format == "sse":
+        headers["Content-Type"] = "text/event-stream; charset=utf-8"
+    elif format == "ndjson":
+        headers["Content-Type"] = "application/x-ndjson; charset=utf-8"
+    else:
+        headers["Content-Type"] = "text/plain; charset=utf-8"
+
     async def generate():
-        if format == "text":
-            # Plain text streaming
-            async for event in stream_query_response(
-                request.question,
-                request.top_k,
-                request.temperature,
-                request.max_tokens,
-                request.include_sources,
-                stream_format="ndjson",  # Use NDJSON internally for parsing
-                show_thoughts=show_thoughts
-            ):
-                try:
-                    data = json.loads(event.split("data: ")[1].strip())
-                    if data.get("event") == "token":
-                        yield data["data"].get("content", "")
-                    elif data.get("event") == "final":
-                        yield "\n\n" + data["data"].get("answer", "")
-                except Exception:
-                    pass
-        else:
-            # SSE or NDJSON streaming
-            async for event in stream_query_response(
-                request.question,
-                request.top_k,
-                request.temperature,
-                request.max_tokens,
-                request.include_sources,
-                stream_format=format,
-                show_thoughts=show_thoughts
-            ):
-                yield event
+        try:
+            if format == "text":
+                # Plain text streaming with Unicode support
+                async for event in stream_query_response(
+                    request.question,
+                    request.top_k,
+                    request.temperature,
+                    request.max_tokens,
+                    request.include_sources,
+                    stream_format="sse",  # Use SSE internally for parsing
+                    show_thoughts=show_thoughts
+                ):
+                    try:
+                        # Parse SSE event to extract content
+                        if event.startswith("event: token"):
+                            # Extract data from next line
+                            lines = event.split('\n')
+                            for line in lines:
+                                if line.startswith("data: "):
+                                    try:
+                                        data = json.loads(line[6:])
+                                        content = data.get("data", {}).get("content", "")
+                                        if content:
+                                            # Ensure proper Unicode encoding
+                                            yield StreamingEncoder.ensure_unicode(content)
+                                    except Exception:
+                                        pass
+                        elif event.startswith("event: final"):
+                            # Final answer
+                            lines = event.split('\n')
+                            for line in lines:
+                                if line.startswith("data: "):
+                                    try:
+                                        data = json.loads(line[6:])
+                                        answer = data.get("data", {}).get("answer", "")
+                                        if answer:
+                                            # Ensure proper Unicode encoding
+                                            yield "\n\n" + StreamingEncoder.ensure_unicode(answer)
+                                    except Exception:
+                                        pass
+                    except Exception as e:
+                        logger.warning(f"Text streaming parse error: {e}")
+            else:
+                # SSE or NDJSON streaming with proper encoding
+                async for event in stream_query_response(
+                    request.question,
+                    request.top_k,
+                    request.temperature,
+                    request.max_tokens,
+                    request.include_sources,
+                    stream_format=format,
+                    show_thoughts=show_thoughts
+                ):
+                    # Ensure event is properly encoded
+                    yield StreamingEncoder.ensure_unicode(event)
+
+        except Exception as e:
+            # Send error event with proper encoding
+            error_data = {"message": str(e), "type": type(e).__name__}
+            if format == "text":
+                yield f"\n\nError: {str(e)}"
+            elif format == "sse":
+                yield StreamingEncoder.format_sse_event("error", error_data)
+            else:
+                yield StreamingEncoder.format_ndjson_event("error", error_data)
 
     return StreamingResponse(
         generate(),
         media_type=media_types.get(format, "text/event-stream"),
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"  # Disable nginx buffering
-        }
+        headers=headers
     )
 
 
@@ -701,20 +368,30 @@ async def ingest_documents_stream(
         )
 
     async def generate():
-        async for event in stream_document_ingestion(
-            files,
-            chunk_size,
-            chunk_overlap,
-            chunking_strategy
-        ):
-            yield event
+        try:
+            async for event in stream_document_ingestion(
+                files,
+                chunk_size,
+                chunk_overlap,
+                chunking_strategy
+            ):
+                # Ensure event is properly encoded
+                yield StreamingEncoder.ensure_unicode(event)
+
+        except Exception as e:
+            # Send error event with proper encoding
+            error_data = {"message": str(e), "type": type(e).__name__}
+            yield StreamingEncoder.format_ndjson_event("error", error_data)
 
     return StreamingResponse(
         generate(),
-        media_type="application/x-ndjson",
+        media_type="application/x-ndjson; charset=utf-8",
         headers={
             "Cache-Control": "no-cache",
-            "Connection": "keep-alive"
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "Content-Encoding": "identity",
+            "Transfer-Encoding": "chunked"
         }
     )
 
@@ -728,7 +405,7 @@ async def export_documents(
     format: str = Query("json", description="Export format: json, csv, txt")
 ):
     """
-    Export documents as a streaming download.
+    Export documents as a streaming download with proper encoding.
     """
     state = get_app_state()
     vector_store = state["vector_store"]
@@ -748,29 +425,49 @@ async def export_documents(
     async def generate_json():
         yield '{"documents": ['
         docs = []
+        total = len(vector_store.texts)
+
         for i, (text, metadata) in enumerate(zip(vector_store.texts, vector_store.metadata)):
-            doc = {"id": i, "text": text, "metadata": metadata}
-            docs.append(json.dumps(doc))
-            if i % 10 == 0:
-                yield ",".join(docs) + ("\n" if i < len(vector_store.texts) - 1 else "")
+            # Ensure proper Unicode encoding
+            text = StreamingEncoder.ensure_unicode(text)
+            doc = {
+                "id": i,
+                "text": text,
+                "metadata": metadata
+            }
+            docs.append(json.dumps(doc, ensure_ascii=False))
+
+            if len(docs) >= 10:
+                yield ",".join(docs) + ("\n" if i < total - 1 else "")
                 docs = []
+
         if docs:
             yield ",".join(docs)
         yield "]}"
 
     async def generate_csv():
-        # Header
+        # Proper CSV encoding with Unicode support
+        yield "\uFEFF"  # BOM for UTF-8
         yield "id,text,metadata\n"
+
         for i, (text, metadata) in enumerate(zip(vector_store.texts, vector_store.metadata)):
-            # Escape text for CSV
+            # Ensure proper Unicode encoding
+            text = StreamingEncoder.ensure_unicode(text)
+            # Escape quotes for CSV
             escaped_text = text.replace('"', '""')
-            yield f'"{i}","{escaped_text}","{json.dumps(metadata)}"\n'
+            escaped_metadata = json.dumps(metadata, ensure_ascii=False).replace('"', '""')
+            yield f'"{i}","{escaped_text}","{escaped_metadata}"\n'
 
     async def generate_txt():
+        # Plain text with Unicode support
+        yield "\uFEFF"  # BOM for UTF-8
+
         for i, (text, metadata) in enumerate(zip(vector_store.texts, vector_store.metadata)):
+            # Ensure proper Unicode encoding
+            text = StreamingEncoder.ensure_unicode(text)
             yield f"=== Document {i} ===\n"
             if metadata:
-                yield f"Metadata: {json.dumps(metadata, indent=2)}\n"
+                yield f"Metadata: {json.dumps(metadata, ensure_ascii=False, indent=2)}\n"
             yield f"Text: {text}\n\n"
 
     generators = {
@@ -780,9 +477,9 @@ async def export_documents(
     }
 
     media_types = {
-        "json": "application/json",
-        "csv": "text/csv",
-        "txt": "text/plain"
+        "json": "application/json; charset=utf-8",
+        "csv": "text/csv; charset=utf-8",
+        "txt": "text/plain; charset=utf-8"
     }
 
     filenames = {
@@ -795,7 +492,9 @@ async def export_documents(
         generators[format](),
         media_type=media_types[format],
         headers={
-            "Content-Disposition": f'attachment; filename="{filenames[format]}"'
+            "Content-Disposition": f'attachment; filename="{filenames[format]}"',
+            "Content-Encoding": "identity",
+            "Transfer-Encoding": "chunked"
         }
     )
 
@@ -816,9 +515,6 @@ async def chat_stream(
     """
     Chat with streaming response and conversation history.
     """
-    # Use session_id to maintain conversation history
-    # In production, store history in Redis or database
-
     state = get_app_state()
 
     if not state["retriever"] or not state["llm_interface"]:
@@ -835,9 +531,9 @@ async def chat_stream(
 
     async def generate():
         try:
-            # Get conversation history for session
-            # For demo, we'll just use a simple context
-            history = []
+            # Sanitize question
+            from src.utils.security import InputValidator
+            question = InputValidator.sanitize_query(question)
 
             # Send initial acknowledgment
             yield f"data: {json.dumps({'event': 'start', 'data': {'session_id': session_id or 'new'}})}\n\n"
@@ -859,11 +555,11 @@ async def chat_stream(
                 for r in retrieval_results[:3]
             ]
 
-            # Generate prompt with history
+            # Generate prompt
+            from src.generation.prompt_templates import get_rag_prompt
             prompt = get_rag_prompt(
                 question=question,
-                chunks=context_chunks,
-                history=history
+                chunks=context_chunks
             )
 
             # Stream response
@@ -878,8 +574,10 @@ async def chat_stream(
             full_response = ""
             for chunk in llm_stream:
                 if isinstance(chunk, LLMResponse) and chunk.content:
-                    full_response += chunk.content
-                    yield f"data: {json.dumps({'event': 'token', 'data': {'content': chunk.content}})}\n\n"
+                    # Ensure proper Unicode encoding
+                    content = StreamingEncoder.ensure_unicode(chunk.content)
+                    full_response += content
+                    yield f"data: {json.dumps({'event': 'token', 'data': {'content': content}})}\n\n"
 
             # Post-process
             processed = await run_in_threadpool(
@@ -889,28 +587,30 @@ async def chat_stream(
                 True
             )
 
+            # Ensure answer is properly encoded
+            answer = StreamingEncoder.ensure_unicode(processed.cleaned_text)
+
             # Send final response
-            yield f"data: {json.dumps({'event': 'final', 'data': {'answer': processed.cleaned_text, 'confidence': processed.confidence}})}\n\n"
+            yield f"data: {json.dumps({'event': 'final', 'data': {'answer': answer, 'confidence': processed.confidence}})}\n\n"
 
         except Exception as e:
-            yield f"data: {json.dumps({'event': 'error', 'data': {'message': str(e)}})}\n\n"
+            error_msg = StreamingEncoder.ensure_unicode(str(e))
+            yield f"data: {json.dumps({'event': 'error', 'data': {'message': error_msg}})}\n\n"
 
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(
         generate(),
-        media_type="text/event-stream",
+        media_type="text/event-stream; charset=utf-8",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
+            "X-Accel-Buffering": "no",
+            "Content-Encoding": "identity",
+            "Transfer-Encoding": "chunked"
         }
     )
 
-
-# ============================================================
-# SSE Helper Endpoint
-# ============================================================
 
 @router.get(
     "/stream/health",
@@ -923,15 +623,263 @@ async def stream_health():
     """
     async def generate():
         for i in range(5):
-            yield f"data: {json.dumps({'event': 'ping', 'data': {'count': i, 'timestamp': datetime.now().isoformat()}})}\n\n"
+            # Ensure proper encoding
+            data = {
+                'event': 'ping',
+                'data': {
+                    'count': i,
+                    'timestamp': datetime.now().isoformat(),
+                    'message': f'Ping {i+1} of 5'
+                }
+            }
+            json_data = json.dumps(data, ensure_ascii=False)
+            yield f"data: {json_data}\n\n"
             await asyncio.sleep(1)
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(
         generate(),
-        media_type="text/event-stream",
+        media_type="text/event-stream; charset=utf-8",
         headers={
             "Cache-Control": "no-cache",
-            "Connection": "keep-alive"
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "Content-Encoding": "identity",
+            "Transfer-Encoding": "chunked"
         }
     )
+
+
+# ============================================================
+# Helper Functions (Updated with Encoding Support)
+# ============================================================
+
+async def stream_query_response(
+    question: str,
+    top_k: int = 5,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+    include_sources: bool = True,
+    stream_format: str = "sse",
+    show_thoughts: bool = False
+) -> AsyncGenerator[str, None]:
+    """
+    Stream query response with progressive updates and proper encoding.
+    """
+    state = get_app_state()
+    start_time = time.time()
+
+    # Validate state
+    if not state["retriever"] or not state["llm_interface"]:
+        error_data = {"message": "System not fully initialized"}
+        if stream_format == "sse":
+            yield StreamingEncoder.format_sse_event("error", error_data)
+        else:
+            yield StreamingEncoder.format_ndjson_event("error", error_data)
+        return
+
+    if state["vector_store"].get_size() == 0:
+        error_data = {"message": "No documents ingested. Please upload documents first."}
+        if stream_format == "sse":
+            yield StreamingEncoder.format_sse_event("error", error_data)
+        else:
+            yield StreamingEncoder.format_ndjson_event("error", error_data)
+        return
+
+    try:
+        # Sanitize question
+        from src.utils.security import InputValidator
+        question = InputValidator.sanitize_query(question)
+
+        # Start event
+        start_data = {
+            "question": StreamingEncoder.ensure_unicode(question),
+            "top_k": top_k,
+            "model": state["config"].llm.model,
+            "timestamp": datetime.now().isoformat()
+        }
+
+        if stream_format == "sse":
+            yield StreamingEncoder.format_sse_event("start", start_data)
+        else:
+            yield StreamingEncoder.format_ndjson_event("start", start_data)
+
+        # Progress: Retrieving documents
+        progress_data = {
+            "stage": "retrieving",
+            "message": "Searching for relevant documents...",
+            "progress": 0.2
+        }
+
+        if stream_format == "sse":
+            yield StreamingEncoder.format_sse_event("progress", progress_data)
+        else:
+            yield StreamingEncoder.format_ndjson_event("progress", progress_data)
+
+        # Retrieve documents
+        retrieval_start = time.time()
+        retrieval_results = await run_in_threadpool(
+            state["retriever"].retrieve,
+            question,
+            top_k=top_k
+        )
+        retrieval_time = (time.time() - retrieval_start) * 1000
+
+        if not retrieval_results:
+            final_data = {
+                "answer": "I couldn't find any relevant information in the documents to answer your question.",
+                "confidence": 0.0,
+                "sources": [],
+                "tokens_used": 0,
+                "processing_time_ms": (time.time() - start_time) * 1000
+            }
+
+            if stream_format == "sse":
+                yield StreamingEncoder.format_sse_event("final", final_data)
+                yield StreamingEncoder.format_sse_event("done", {"timestamp": datetime.now().isoformat()})
+            else:
+                yield StreamingEncoder.format_ndjson_event("final", final_data)
+                yield StreamingEncoder.format_ndjson_event("done", {})
+            return
+
+        # Send sources
+        if include_sources:
+            sources = []
+            for r in retrieval_results[:5]:
+                sources.append({
+                    "text": StreamingEncoder.ensure_unicode(r.text[:300] + "..." if len(r.text) > 300 else r.text),
+                    "score": r.score,
+                    "metadata": r.metadata
+                })
+
+            source_data = {
+                "sources": sources,
+                "retrieval_time_ms": retrieval_time
+            }
+
+            if stream_format == "sse":
+                yield StreamingEncoder.format_sse_event("source", source_data)
+            else:
+                yield StreamingEncoder.format_ndjson_event("source", source_data)
+
+        # Progress: Generating response
+        progress_data = {
+            "stage": "generating",
+            "message": f"Generating response using {len(retrieval_results)} sources...",
+            "progress": 0.5
+        }
+
+        if stream_format == "sse":
+            yield StreamingEncoder.format_sse_event("progress", progress_data)
+        else:
+            yield StreamingEncoder.format_ndjson_event("progress", progress_data)
+
+        # Prepare context
+        context_chunks = [
+            {"text": r.text, "source": r.metadata.get("file_path", "Unknown")}
+            for r in retrieval_results[:3]
+        ]
+
+        # Generate prompt
+        prompt = get_rag_prompt(
+            question=question,
+            chunks=context_chunks
+        )
+
+        # Stream LLM response
+        full_response = ""
+        token_count = 0
+
+        # Generate response with streaming
+        llm_stream = await run_in_threadpool(
+            state["llm_interface"].generate,
+            [{"role": "user", "content": prompt}],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True
+        )
+
+        # Process stream
+        for chunk in llm_stream:
+            if isinstance(chunk, LLMResponse) and chunk.content:
+                token_count += 1
+                # Ensure content is properly encoded
+                content = StreamingEncoder.ensure_unicode(chunk.content)
+                full_response += content
+
+                # Send token chunk
+                token_data = {
+                    "content": content,
+                    "token_count": token_count
+                }
+
+                if stream_format == "sse":
+                    yield StreamingEncoder.format_sse_event("token", token_data)
+                else:
+                    yield StreamingEncoder.format_ndjson_event("token", token_data)
+
+                # Update progress
+                if token_count % 10 == 0:
+                    progress = min(0.9, 0.5 + (token_count / 100) * 0.4)
+                    progress_data = {
+                        "stage": "generating",
+                        "message": f"Generating... ({token_count} tokens)",
+                        "progress": progress
+                    }
+
+                    if stream_format == "sse":
+                        yield StreamingEncoder.format_sse_event("progress", progress_data)
+                    else:
+                        yield StreamingEncoder.format_ndjson_event("progress", progress_data)
+
+        # Post-process response
+        processed_response = await run_in_threadpool(
+            postprocess_response,
+            full_response,
+            str(context_chunks[:3]),
+            aggressive_cleaning=True
+        )
+
+        # Ensure answer is properly encoded
+        answer = StreamingEncoder.ensure_unicode(processed_response.cleaned_text)
+
+        # Prepare final response
+        final_sources = []
+        if include_sources:
+            for r in retrieval_results[:5]:
+                final_sources.append({
+                    "text": StreamingEncoder.ensure_unicode(r.text[:500] + "..." if len(r.text) > 500 else r.text),
+                    "score": r.score,
+                    "metadata": r.metadata
+                })
+
+        # Send final response
+        final_data = {
+            "answer": answer,
+            "confidence": processed_response.confidence,
+            "sources": final_sources,
+            "tokens_used": token_count,
+            "has_hallucination": processed_response.has_hallucination,
+            "processing_time_ms": (time.time() - start_time) * 1000,
+            "retrieval_time_ms": retrieval_time,
+            "generation_time_ms": (time.time() - retrieval_start) * 1000
+        }
+
+        if stream_format == "sse":
+            yield StreamingEncoder.format_sse_event("final", final_data)
+            yield StreamingEncoder.format_sse_event("done", {"timestamp": datetime.now().isoformat()})
+        else:
+            yield StreamingEncoder.format_ndjson_event("final", final_data)
+            yield StreamingEncoder.format_ndjson_event("done", {})
+
+    except Exception as e:
+        logger.error(f"Streaming query failed: {e}", exc_info=True)
+        error_data = {
+            "message": StreamingEncoder.ensure_unicode(str(e)),
+            "type": type(e).__name__
+        }
+
+        if stream_format == "sse":
+            yield StreamingEncoder.format_sse_event("error", error_data)
+        else:
+            yield StreamingEncoder.format_ndjson_event("error", error_data)

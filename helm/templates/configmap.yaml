@@ -1,0 +1,87 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "docqa-ai.fullname" . }}-config
+  labels:
+    {{- include "docqa-ai.labels" . | nindent 4 }}
+data:
+  app-config.yaml: |
+    environment: {{ .Values.config.environment }}
+    debug: {{ .Values.config.debug }}
+    log_level: {{ .Values.config.logLevel }}
+    
+    llm:
+      provider: {{ .Values.config.llm.provider }}
+      model: {{ .Values.config.llm.model }}
+      temperature: {{ .Values.config.llm.temperature }}
+      max_tokens: {{ .Values.config.llm.maxTokens }}
+      timeout: {{ .Values.config.llm.timeout }}
+      max_retries: {{ .Values.config.llm.maxRetries }}
+    
+    embedding:
+      provider: {{ .Values.config.embedding.provider }}
+      model: {{ .Values.config.embedding.model }}
+      dimension: {{ .Values.config.embedding.dimension }}
+      batch_size: {{ .Values.config.embedding.batchSize }}
+      cache_enabled: {{ .Values.config.embedding.cacheEnabled }}
+    
+    vector_store:
+      store_type: {{ .Values.config.vectorStore.type }}
+      index_type: {{ .Values.config.vectorStore.indexType }}
+      metric: {{ .Values.config.vectorStore.metric }}
+      ef_search: {{ .Values.config.vectorStore.efSearch }}
+      ef_construction: {{ .Values.config.vectorStore.efConstruction }}
+      m: {{ .Values.config.vectorStore.m }}
+    
+    retrieval:
+      top_k: {{ .Values.config.retrieval.topK }}
+      score_threshold: {{ .Values.config.retrieval.scoreThreshold }}
+      enable_hybrid_search: {{ .Values.config.retrieval.enableHybridSearch }}
+      enable_reranking: {{ .Values.config.retrieval.enableReranking }}
+      vector_weight: {{ .Values.config.retrieval.vectorWeight }}
+      keyword_weight: {{ .Values.config.retrieval.keywordWeight }}
+    
+    processing:
+      chunk_size: {{ .Values.config.processing.chunkSize }}
+      chunk_overlap: {{ .Values.config.processing.chunkOverlap }}
+      chunking_strategy: {{ .Values.config.processing.chunkingStrategy }}
+      max_file_size_mb: {{ .Values.config.processing.maxFileSizeMb }}
+    
+    monitoring:
+      enabled: {{ .Values.config.monitoring.enabled }}
+      metrics_port: {{ .Values.config.monitoring.metricsPort }}
+      enable_tracing: {{ .Values.config.monitoring.enableTracing }}
+
+  env-config.yaml: |
+    ENVIRONMENT: {{ .Values.config.environment }}
+    LOG_LEVEL: {{ .Values.config.logLevel }}
+    API_HOST: 0.0.0.0
+    API_PORT: "8000"
+    WORKERS: "{{ .Values.config.api.workers }}"
+    RATE_LIMIT: {{ .Values.config.api.rateLimit }}
+    REQUEST_TIMEOUT: {{ .Values.config.api.requestTimeout | quote }}
+    MAX_REQUEST_SIZE: {{ .Values.config.api.maxRequestSize | quote }}
+    
+    DB_HOST: {{ .Values.database.host | default (printf "%s-postgresql" .Release.Name) }}
+    DB_PORT: {{ .Values.database.port | quote }}
+    DB_NAME: {{ .Values.database.name }}
+    DB_USER: {{ .Values.database.user }}
+    DB_POOL_SIZE: {{ .Values.database.poolSize | quote }}
+    DB_MAX_OVERFLOW: {{ .Values.database.maxOverflow | quote }}
+    DB_SSL_MODE: {{ .Values.database.sslMode }}
+    
+    REDIS_HOST: {{ .Values.cache.host | default (printf "%s-redis-master" .Release.Name) }}
+    REDIS_PORT: {{ .Values.cache.port | quote }}
+    REDIS_DB: {{ .Values.cache.db | quote }}
+    CACHE_TTL_SECONDS: {{ .Values.cache.ttlSeconds | quote }}
+    CACHE_MAX_SIZE: {{ .Values.cache.maxSize | quote }}
+    
+    S3_DOCUMENTS_BUCKET: {{ .Values.s3.bucket }}
+    S3_EMBEDDINGS_BUCKET: {{ .Values.s3.embeddingsBucket }}
+    S3_REGION: {{ .Values.s3.region }}
+    
+    MONITORING_ENABLED: {{ .Values.config.monitoring.enabled | quote }}
+    METRICS_PORT: {{ .Values.config.monitoring.metricsPort | quote }}
+    
+    TRACING_ENABLED: {{ .Values.tracing.enabled | quote }}
+    TRACING_SAMPLE_RATE: {{ .Values.tracing.sampleRate | quote }}

@@ -1,0 +1,433 @@
+# ============================================================================
+# DocQA AI - Helm Values
+# ============================================================================
+
+# Global settings
+global:
+  imageRegistry: ""
+  imagePullSecrets: []
+  storageClass: ""
+  defaultStorageClass: standard
+  domain: docqa-ai.com
+  environment: production
+
+# Application image
+image:
+  repository: yourregistry/docqa-ai
+  tag: latest
+  pullPolicy: Always
+  pullSecrets: []
+
+# Replica count
+replicaCount: 3
+
+# Application name
+nameOverride: ""
+fullnameOverride: ""
+
+# Service account
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+# Pod security context
+podSecurityContext:
+  fsGroup: 1000
+
+# Container security context
+securityContext:
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 1000
+
+# Container resources
+resources:
+  requests:
+    memory: "1Gi"
+    cpu: "500m"
+  limits:
+    memory: "4Gi"
+    cpu: "2"
+
+# Autoscaling
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+# Pod disruption budget
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+# Rolling update strategy
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+
+# Liveness and readiness probes
+probes:
+  liveness:
+    enabled: true
+    path: /health
+    port: 8000
+    initialDelaySeconds: 30
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readiness:
+    enabled: true
+    path: /health
+    port: 8000
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  startup:
+    enabled: true
+    path: /health
+    port: 8000
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    failureThreshold: 30
+
+# Service configuration
+service:
+  type: ClusterIP
+  port: 8000
+  metricsPort: 9090
+  annotations: {}
+
+# Ingress configuration
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/rate-limit-burst: "200"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+  hosts:
+    - host: docqa-ai.com
+      paths:
+        - path: /
+          pathType: Prefix
+    - host: api.docqa-ai.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - hosts:
+        - docqa-ai.com
+        - api.docqa-ai.com
+      secretName: docqa-tls
+
+# Application configuration
+config:
+  environment: production
+  debug: false
+  logLevel: INFO
+  api:
+    host: 0.0.0.0
+    port: 8000
+    workers: 4
+    rateLimit: 1000/minute
+    requestTimeout: 60
+    maxRequestSize: 104857600
+  llm:
+    provider: openai
+    model: gpt-4
+    temperature: 0.3
+    maxTokens: 2000
+    timeout: 60
+    maxRetries: 5
+  embedding:
+    provider: openai
+    model: text-embedding-3-small
+    dimension: 1536
+    batchSize: 50
+    cacheEnabled: true
+  vectorStore:
+    type: faiss
+    indexType: HNSW64
+    metric: cosine
+    efSearch: 200
+    efConstruction: 400
+    m: 32
+  retrieval:
+    topK: 5
+    scoreThreshold: 0.6
+    enableHybridSearch: true
+    enableReranking: true
+    vectorWeight: 0.6
+    keywordWeight: 0.4
+  processing:
+    chunkSize: 800
+    chunkOverlap: 150
+    chunkingStrategy: adaptive
+    maxFileSizeMb: 50
+  monitoring:
+    enabled: true
+    metricsPort: 9090
+    enableTracing: true
+
+# Secrets (should be overridden with actual values)
+secrets:
+  # Database
+  dbPassword: ""
+  # Redis
+  redisPassword: ""
+  # API Keys
+  openaiApiKey: ""
+  anthropicApiKey: ""
+  # JWT
+  jwtSecretKey: ""
+  # API Keys for authentication
+  apiKeys: ""
+
+# Database configuration
+database:
+  host: ""
+  port: 5432
+  name: docqa
+  user: docqa
+  poolSize: 20
+  maxOverflow: 40
+  sslMode: require
+
+# Cache configuration
+cache:
+  host: ""
+  port: 6379
+  db: 0
+  ttlSeconds: 7200
+  maxSize: 10000
+
+# S3 configuration
+s3:
+  bucket: docqa-documents
+  embeddingsBucket: docqa-embeddings
+  region: us-east-1
+
+# Monitoring configuration
+monitoring:
+  enabled: true
+  prometheus:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      interval: 15s
+  grafana:
+    enabled: true
+    dashboards:
+      enabled: true
+  alerts:
+    enabled: true
+    cpuThreshold: 80
+    memoryThreshold: 85
+    errorRateThreshold: 5
+    latencyThreshold: 1000
+
+# Tracing configuration
+tracing:
+  enabled: true
+  jaeger:
+    enabled: true
+    agent:
+      host: jaeger-agent
+      port: 6831
+  sampleRate: 1.0
+
+# Logging configuration
+logging:
+  level: INFO
+  format: json
+  maxSizeMb: 100
+  backupCount: 10
+  compressOldLogs: true
+
+# Persistence
+persistence:
+  enabled: true
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 100Gi
+  data:
+    enabled: true
+    mountPath: /app/data
+    subPath: data
+  logs:
+    enabled: true
+    mountPath: /var/log/docqa
+    subPath: logs
+
+# Extra volumes
+extraVolumes: []
+extraVolumeMounts: []
+
+# Node selector
+nodeSelector: {}
+
+# Tolerations
+tolerations: []
+
+# Affinity
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - docqa-ai
+          topologyKey: kubernetes.io/hostname
+
+# Pod annotations
+podAnnotations: {}
+
+# Service annotations
+serviceAnnotations: {}
+
+# Additional labels
+extraLabels: {}
+
+# Priority class
+priorityClassName: ""
+
+# Init containers
+initContainers: []
+
+# Sidecar containers
+sidecars: []
+
+# Configuration for dependencies
+postgresql:
+  enabled: true
+  image:
+    tag: 15-alpine
+  architecture: standalone
+  auth:
+    username: docqa
+    password: docqa123
+    database: docqa
+  primary:
+    persistence:
+      enabled: true
+      size: 50Gi
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+
+redis:
+  enabled: true
+  image:
+    tag: 7-alpine
+  architecture: standalone
+  auth:
+    enabled: true
+    password: redis123
+  master:
+    persistence:
+      enabled: true
+      size: 10Gi
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+
+prometheus:
+  enabled: true
+  prometheusSpec:
+    serviceMonitorSelector:
+      matchLabels:
+        app: docqa-ai
+    retention: 15d
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 50Gi
+
+grafana:
+  enabled: true
+  adminPassword: admin
+  persistence:
+    enabled: true
+    size: 10Gi
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: 'default'
+          orgId: 1
+          folder: ''
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/default
+  dashboards:
+    default:
+      docqa:
+        gnetId: 1860
+        revision: 1
+        datasource: prometheus
+  datasources:
+    datasources.yaml:
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          url: http://prometheus-server:80
+          access: proxy
+          isDefault: true
+
+jaeger:
+  enabled: true
+  agent:
+    enabled: true
+  collector:
+    enabled: true
+  query:
+    enabled: true
+  storage:
+    type: memory
+
+nginx-ingress:
+  enabled: true
+  controller:
+    replicaCount: 2
+    ingressClass: nginx
+    service:
+      type: LoadBalancer
+    config:
+      use-forwarded-headers: true
+      compute-full-forwarded-for: true
+      proxy-body-size: 100m
+      proxy-read-timeout: 60
+      proxy-send-timeout: 60
+      proxy-connect-timeout: 60
+      proxy-buffer-size: 8k
+      rate-limit: 100
+      rate-limit-burst: 200
+      rate-limit-window: 1m

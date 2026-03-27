@@ -1,0 +1,63 @@
+apiVersion: v2
+name: docqa-ai
+description: DocQA AI - Production-ready RAG system for document question answering
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - rag
+  - llm
+  - document-qa
+  - ai
+  - search
+home: https://docqa-ai.com
+sources:
+  - https://github.com/yourusername/docqa-ai
+maintainers:
+  - name: DocQA AI Team
+    email: team@docqa-ai.com
+icon: https://docqa-ai.com/logo.png
+
+dependencies:
+  - name: postgresql
+    version: "12.x.x"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition: postgresql.enabled
+    tags:
+      - database
+      - postgresql
+  - name: redis
+    version: "17.x.x"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition: redis.enabled
+    tags:
+      - cache
+      - redis
+  - name: prometheus
+    version: "25.x.x"
+    repository: "https://prometheus-community.github.io/helm-charts"
+    condition: monitoring.prometheus.enabled
+    tags:
+      - monitoring
+      - prometheus
+  - name: grafana
+    version: "6.x.x"
+    repository: "https://grafana.github.io/helm-charts"
+    condition: monitoring.grafana.enabled
+    tags:
+      - monitoring
+      - grafana
+  - name: jaeger
+    version: "2.x.x"
+    repository: "https://jaegertracing.github.io/helm-charts"
+    condition: tracing.jaeger.enabled
+    tags:
+      - tracing
+      - jaeger
+  - name: nginx-ingress
+    version: "9.x.x"
+    repository: "https://kubernetes.github.io/ingress-nginx"
+    condition: ingress.nginx.enabled
+    tags:
+      - ingress
+      - nginx

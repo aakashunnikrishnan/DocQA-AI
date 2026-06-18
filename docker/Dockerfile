@@ -1,6 +1,6 @@
 # Multi-stage build for DocQA AI
 # Stage 1: Builder - Install dependencies and build
-FROM python:3.10-slim as builder
+FROM python:3.14-slim as builder
 
 WORKDIR /app
 
@@ -22,7 +22,7 @@ COPY requirements.txt requirements-dev.txt ./
 RUN pip install --no-cache-dir --user -r requirements.txt
 
 # Stage 2: Production image
-FROM python:3.10-slim
+FROM python:3.14-slim
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \

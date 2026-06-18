@@ -410,7 +410,7 @@ jobs:
           pip-compile --upgrade requirements-dev.in -o requirements-dev.txt
 
       - name: Create Pull Request
-        uses: peter-evans/create-pull-request@v6
+        uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: 'chore(deps): update dependencies'
